@@ -4,6 +4,7 @@ import "context"
 
 type Status string
 type TaxCategory string
+type Market string
 
 const (
 	StatusActive       Status = "ACTIVE"
@@ -12,6 +13,10 @@ const (
 	TaxStandard TaxCategory = "STANDARD"
 	TaxReduced  TaxCategory = "REDUCED"
 	TaxExempt   TaxCategory = "EXEMPT"
+
+	MarketCC Market = "CC"
+	MarketMX Market = "MX"
+	MarketAR Market = "AR"
 )
 
 type Product struct {
