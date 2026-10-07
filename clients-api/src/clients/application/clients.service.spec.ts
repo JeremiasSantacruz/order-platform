@@ -13,13 +13,12 @@ describe('ClientsService', () => {
     it('normalizes and returns an existing client', () => {
       const client = service.getById('  cli-0001  ');
       expect(client).toEqual({
-        id: 'CLI-0001',
+        clientId: 'CLI-0001',
         name: 'Distribuidora Central',
         market: 'MX',
         status: 'ACTIVE',
         segment: 'WHOLESALE',
         taxRegime: 'GENERAL',
-        createdAt: new Date('2024-01-15T10:00:00Z'),
       });
     });
 
@@ -34,13 +33,13 @@ describe('ClientsService', () => {
 
   describe('getAll', () => {
     it('returns all seeded clients', () => {
-      expect(service.getAll()).toHaveLength(9);
+      expect(service.getAll()).toHaveLength(10);
     });
 
     it('returns copies so callers cannot mutate the store', () => {
       const all = service.getAll();
       all.pop();
-      expect(service.getAll()).toHaveLength(9);
+      expect(service.getAll()).toHaveLength(10);
     });
   });
 });

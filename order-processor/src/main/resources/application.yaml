@@ -1,3 +1,48 @@
 spring:
   application:
     name: order-processor
+
+  # --- Interfaz de entrada Kafka -------------------------------------------------
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+    consumer:
+      group-id: ${KAFKA_CONSUMER_GROUP:order-processor}
+      auto-offset-reset: earliest
+      enable-auto-commit: false
+      # El payload se consume como String crudo: conserva el original para la DLT y
+      # permite clasificar los errores de contrato en el listener.
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+    producer:
+      # Serializadores para las dos salidas Kafka: orders.processed.v1 y la DLT.
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.apache.kafka.common.serialization.StringSerializer
+    listener:
+      # Commit por registro: el offset se confirma cuando el listener termina sin error.
+      ack-mode: record
+
+  # --- Interfaz de salida: persistencia del agregado Order ------------------------
+  data:
+    mongodb:
+      uri: ${MONGO_URI:mongodb://localhost:27017/orders_db}
+
+# Contratos de la sección 5 de Expecificaciones.md
+app:
+  kafka:
+    topics:
+      orders-created: orders.created.v1
+      orders-created-dlt: orders.processing.dlt
+      orders-processed: orders.processed.v1
+    consumer:
+      # Reintentos con backoff exponencial para fallos transitorios (429/5xx/timeout).
+      max-retries: 3
+
+  # --- Interfaz de salida HTTP (secciones 5.B y 5.C) ------------------------------
+  clients:
+    base-url: ${CLIENTS_API_BASE_URL:http://localhost:3000}
+    connect-timeout-ms: ${CLIENTS_CONNECT_TIMEOUT_MS:3000}
+    read-timeout-ms: ${CLIENTS_READ_TIMEOUT_MS:5000}
+  products:
+    base-url: ${PRODUCTS_API_BASE_URL:http://localhost:8082}
+    connect-timeout-ms: ${PRODUCTS_CONNECT_TIMEOUT_MS:3000}
+    read-timeout-ms: ${PRODUCTS_READ_TIMEOUT_MS:5000}

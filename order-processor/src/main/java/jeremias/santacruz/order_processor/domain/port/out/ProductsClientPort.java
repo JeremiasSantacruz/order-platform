@@ -13,11 +13,14 @@ public interface ProductsClientPort {
      * @param productIds Conjunto de IDs de productos a consultar
      * @param market Mercado correspondiente a la búsqueda
      * @return Mapa asociando productId con su modelo de dominio Product
+     * @throws ExternalServiceException si ocurre un fallo técnico/transitorio no recuperable
      */
     Map<String, Product> getProducts(Set<String> productIds, String market);
 
     /**
      * Consulta individual de un producto por su ID y mercado.
+     *
+     * @throws ExternalServiceException si ocurre un fallo técnico/transitorio no recuperable
      */
     Optional<Product> getProduct(String productId, String market);
 }

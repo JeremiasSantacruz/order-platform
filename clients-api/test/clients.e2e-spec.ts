@@ -26,13 +26,12 @@ describe('Clients API (e2e)', () => {
       .get('/clients/cli-0001')
       .expect(200)
       .expect({
-        id: 'CLI-0001',
+        clientId: 'CLI-0001',
         name: 'Distribuidora Central',
         market: 'MX',
         status: 'ACTIVE',
         segment: 'WHOLESALE',
         taxRegime: 'GENERAL',
-        createdAt: '2024-01-15T10:00:00.000Z',
       });
   });
 

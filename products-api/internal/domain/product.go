@@ -14,9 +14,9 @@ const (
 	TaxReduced  TaxCategory = "REDUCED"
 	TaxExempt   TaxCategory = "EXEMPT"
 
-	MarketCC Market = "CC"
 	MarketMX Market = "MX"
-	MarketAR Market = "AR"
+	MarketCO Market = "CO"
+	MarketPE Market = "PE"
 )
 
 type Product struct {

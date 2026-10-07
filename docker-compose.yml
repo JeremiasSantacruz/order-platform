@@ -160,6 +160,32 @@ services:
     profiles:
       - full
 
+  # Order Processor (Java / Spring Boot worker)
+  order-processor:
+    build:
+      context: ./order-processor
+      dockerfile: Dockerfile
+    container_name: order-processor
+    restart: unless-stopped
+    networks:
+      - order-network
+    environment:
+      # Consumo del broker interno de Kafka (application.yaml usa KAFKA_BOOTSTRAP_SERVERS).
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      # Persistencia del agregado Order (base propia, distinta de catalog_db).
+      MONGO_URI: mongodb://product:secret@db-product:27017/orders_db?authSource=admin
+      # Contratos de salida hacia los servicios internos (secciones 5.B y 5.C).
+      CLIENTS_API_BASE_URL: http://clients-api:3000
+      PRODUCTS_API_BASE_URL: http://products-api:8082
+    depends_on:
+      kafka:
+        condition: service_healthy
+      db-product:
+        condition: service_healthy
+    # Worker sin API HTTP: no expone puertos.
+    profiles:
+      - full
+
 volumes:
   mongo-data:
     driver: local

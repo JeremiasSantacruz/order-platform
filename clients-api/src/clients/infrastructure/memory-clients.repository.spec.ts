@@ -16,7 +16,7 @@ describe('MemoryClientsRepository', () => {
   it('finds a client by id', () => {
     const client = repository.getById('CLI-0001');
     expect(client).toMatchObject({
-      id: 'CLI-0001',
+      clientId: 'CLI-0001',
       market: 'MX',
       name: 'Distribuidora Central',
     });

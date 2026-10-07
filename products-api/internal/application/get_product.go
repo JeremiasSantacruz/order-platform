@@ -21,9 +21,19 @@ func (uc *GetProductUseCase) Execute(ctx context.Context, id, market string) (do
 	if id == "" {
 		return domain.Product{}, domain.ErrInvalidProductID
 	}
-	if market == "" {
+	if !isValidMarket(market) {
 		return domain.Product{}, domain.ErrInvalidMarket
 	}
 
 	return uc.repo.GetByIDAndMarket(ctx, id, market)
+}
+
+// isValidMarket valida el contrato 5.C: solo MX, CO o PE (sección 5 de Expecificaciones.md).
+func isValidMarket(market string) bool {
+	switch market {
+	case string(domain.MarketMX), string(domain.MarketCO), string(domain.MarketPE):
+		return true
+	default:
+		return false
+	}
 }
