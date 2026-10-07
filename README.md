@@ -66,7 +66,26 @@ puerto HTTP.
 
 ## Verificación end-to-end con el ejemplo de la spec (5.A → 5.D)
 
-Con Kafdrop (`http://localhost:9000`) o `kcat`, publicar en `orders.created.v1` (clave `orderId`):
+### Automática (recomendada): `scripts/smoke-test.sh`
+
+Levanta el stack y valida **6 escenarios** con PASS/FAIL:
+
+```bash
+bash scripts/smoke-test.sh             # build + todos los tests
+bash scripts/smoke-test.sh --no-build  # reutiliza imágenes ya construidas
+bash scripts/smoke-test.sh --skip-dlt  # omite la prueba DLT (apaga products-api)
+```
+
+1. Camino feliz 5.A→5.D (APPROVED, totals 1836.00 / 25.56 / 1810.44 / 289.67 / 2100.11)
+2. Cliente bloqueado → `REJECTED` (CLIENT_INACTIVE)
+3. Producto inexistente → `REJECTED` (PRODUCT_NOT_FOUND)
+4. Fallo transitorio → reintentos con backoff → DLT (`RETRIES_EXHAUSTED` + 7 headers), sin evento de salida
+5. Idempotencia (7.1): re-entrega del mismo `eventId` sin duplicar el documento
+6. Versión vieja (7.3): un evento `eventVersion` menor tras una mayor se ignora
+
+### Manual (con Kafdrop UI)
+
+Publicar en `orders.created.v1` (clave `orderId`) con la UI de Kafdrop (`http://localhost:9000`):
 
 ```json
 {
