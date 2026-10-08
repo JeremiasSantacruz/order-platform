@@ -12,7 +12,13 @@ import java.time.Duration;
  * Fábrica de los clientes HTTP de salida (Clients API y Products API).
  *
  * <p>Los timeouts son parte de la matriz de la sección 7: un read timeout se clasifica como
- * falla de red <b>transitoria</b> y dispara el reintento con backoff del contenedor de Kafka.</p>
+ * falla de red <b>transitoria</b>.</p>
+ *
+ * <p>La resiliencia de las llamadas es declarativa sobre los adaptadores:
+ * {@code @Retry} (Resilience4j, propiedades {@code resilience4j.retry.instances.*}) reintenta con
+ * backoff exponencial los fallos transitorios antes de propagarlos al contenedor de Kafka, y
+ * {@code @RateLimiter} (propiedades {@code resilience4j.ratelimiter.instances.*}) aplica throttling:
+ * un {@code 429} local transitorio cuando se agota la espera por un permiso.</p>
  */
 @Configuration
 public class OutboundServicesConfig {

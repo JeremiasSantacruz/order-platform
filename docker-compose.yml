@@ -15,7 +15,7 @@ services:
     environment:
       MONGO_INITDB_ROOT_USERNAME: product
       MONGO_INITDB_ROOT_PASSWORD: secret
-      MONGO_INITDB_DATABASE: catalog_db
+      MONGO_INITDB_DATABASE: catalog_db, orders_db
     volumes:
       - mongo-data:/data/db
     healthcheck:
@@ -42,7 +42,7 @@ services:
       db-product:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8081"]
+      test: ["CMD", "wget", "-q", "--spider", "--header", "Authorization: Basic YWRtaW46cGFzcw==", "http://127.0.0.1:8081/"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -78,7 +78,7 @@ services:
     environment:
       KAFKA_BROKER_ID: 1
       KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
-      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://kafka:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
       KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
       KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
       KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
@@ -87,7 +87,7 @@ services:
       zookeeper:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "kafka:9092"]
+      test: ["CMD", "kafka-broker-api-versions", "--bootstrap-server", "kafka:29092"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -108,7 +108,7 @@ services:
       kafka:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000"]
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/9000 && printf 'GET / HTTP/1.1\\r\\nHost: 127.0.0.1\\r\\nConnection: close\\r\\n\\r\\n' >&3 && grep -q ' 200 ' <&3"]
       interval: 10s
       timeout: 5s
       retries: 3
@@ -127,10 +127,11 @@ services:
     environment:
       NODE_ENV: production
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://localhost:3000/health', (r) => {if (r.statusCode !== 200) throw new Error(r.statusCode)})"]
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/health"]
       interval: 10s
       timeout: 5s
       retries: 3
+      start_period: 30s
     profiles:
       - full
 
@@ -184,6 +185,64 @@ services:
     profiles:
       - full
 
+  # --- Observabilidad de logs -----------------------------------------------------
+  # Loki: almacén de logs consultable con LogQL (http://localhost:3100).
+  loki:
+    image: grafana/loki:3.6.17
+    container_name: order-loki
+    restart: unless-stopped
+    networks:
+      - order-network
+    ports:
+      - "3100:3100"
+    command: -config.file=/etc/loki/local-config.yaml
+    # Sin healthcheck: la imagen es distroless (no hay shell ni wget).
+    # /ready se puede comprobar desde el host: curl http://localhost:3100/ready
+
+  # Promtail: tail de los stdout de los contenedores (docker.sock) hacia Loki.
+  promtail:
+    image: grafana/promtail:3.6.11
+    container_name: order-promtail
+    restart: unless-stopped
+    networks:
+      - order-network
+    volumes:
+      - ./observability/promtail/config.yml:/etc/promtail/config.yml:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+
+  # Grafana: UI de consulta de logs (admin/admin en local).
+  # El puerto del host es 3001 para no chocar con clients-api (:3000).
+  grafana:
+    image: grafana/grafana:13.0.10
+    container_name: order-grafana
+    restart: unless-stopped
+    networks:
+      - order-network
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - loki
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
 volumes:
   mongo-data:
+    driver: local
+  grafana-data:
     driver: local

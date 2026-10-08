@@ -12,8 +12,8 @@
 - **Dominio:** procesamiento de pedidos B2B originados como eventos Kafka (`orders.created.v1`).
 - **Responsabilidad del worker:** validar el evento, verificar elegibilidad contra los servicios de
   catálogo, calcular importes con precisión financiera y emitir el evento `orders.processed.v1`.
-- **Objetivos no funcionales prioritarios (sección 7):** idempotencia ante re-entregas, resolución
-  de concurrencia por `orderId`/`eventVersion` y tolerancia a fallos con reintentos + DLT.
+- **Objetivos no funcionales prioritarios:** idempotencia ante re-entregas, resolución
+  de concurrencia por `orderId`/`eventVersion` y tolerancia a fallos con reintentos.
 
 El worker **no expone API HTTP**; su interfaz de entrada es Kafka y su interfaz de salida es
 Kafka + MongoDB.
@@ -21,42 +21,41 @@ Kafka + MongoDB.
 ## 2. Arquitectura de Alto Nivel
 
 ```
-                 ┌────────────────────────────────────────────────────────────┐
-                 │                  docker-compose (order-network)            │
-                 │                                                            │
-  producer       │   ┌─────────────────────┐        ┌─────────────────────┐   │
-  (pedido B2B)   │   │    products-api      │        │    clients-api      │   │
-      │          │   │    (Go, 8082)       │        │  (NestJS, 3000)     │   │
-      ▼          │   └─────────┬───────────┘        └─────────┬───────────┘   │
- ┌────────┐      │             │ GET /products/{id}?market=   │ GET /clients/{id}  │
- │ Kafka  │      │             │ (contrato 5.C)               │ (contrato 5.B)    │
- │ broker │      │             └───────────────┬──────────────┘                   │
- └───┬────┘      │                             │                                  │
-     │           │                    ┌────────▼─────────┐                        │
-     │  orders.created.v1             │  order-processor │   (Java / Spring Boot) │
-     │  (contrato 5.A)                │  hexagonal       │                        │
-     ▼           │                    │  - listener      │                        │
-  consumers      │                    │  - use case      │                        │
-     │           │                    │  - adapters out  │                        │
-     ▼           │                    └───┬─────────┬────┘                        │
- ┌─────────┐     │                        │         │                            │
- │  DLT    │◄────┼────────────────────────┘         │                            │
- │orders.  │     │  orders.processing.dlt           │                            │
- │processing│     │  (7 headers, §7)                 │ persistencia              │
- │dlt      │     │                                  ▼                            │
- └─────────┘     │                          ┌─────────────┐   ┌──────────────┐   │
-                 │                          │   MongoDB   │   │ orders.proc. │   │
-                 │                          │  (orders_db)│   │ essed.v1     │   │
-                 │                          └─────────────┘   │ (contrato 5.D│   │
-                 │                                           └──────────────┘   │
-                 └────────────────────────────────────────────────────────────┘
+                 ┌──────────────────────────────────────────────────────────────────┐
+                 │                  docker-compose (order-network)                  │
+                 │                                                                  │
+  producer       │   ┌─────────────────────┐        ┌─────────────────────┐         │
+  (pedido B2B)   │   │    products-api     │        │    clients-api      │         │
+      │          │   │    (Go, 8082)       │        │  (NestJS, 3000)     │         │
+      ▼          │   └─────────┬───────────┘        └─────────┬───────────┘         │  
+ ┌────────┐      │             │ GET /products/{id}?market=   │ GET /clients/{id}   │
+ │ Kafka  │      │             │                              │                     │
+ │ broker │      │             └───────────────┬──────────────┘                     │
+ └───┬────┘      │                             │                                    │
+     │           │                    ┌────────▼─────────┐                          │
+     │  orders.created.v1             │  order-processor │   (Java / Spring Boot)   │
+     │           │                    │  hexagonal       │                          │
+     │           │                    │  - listener      │                          │
+     │           │                    │  - use case      │                          │
+     │           │                    │  - adapters out  │                          │
+     ▼           │                    └───┬─────────┬────┘                          │
+┌───────────┐   │                        │         │                               │
+ │ consumers │◄──┼────────────────────────┘
+ │ orders.   │   │  orders.processed.v1               │ persistencia
+ │processed. │   │                                  ▼
+ │   v1      │   │                          ┌─────────────┐   ┌──────────────┐      │
+                 │                          │   MongoDB   │   │ orders.proc. │      │
+                 │                          │             │   │ essed.v1     │      │
+                 │                          └─────────────┘   │              │      │
+                 │                                            └──────────────┘      │
+                 └──────────────────────────────────────────────────────────────────┘
 ```
 
 ### Componentes y decisiones de diseño
 
 | Componente | Stack | Rol |
 | --- | --- | --- |
-| `order-processor` | Java 21, Spring Boot 3.5, spring-kafka, spring-data-mongodb | Worker. Arquitectura hexagonal: dominio puro sin Spring/Kafka/Mongo; casos de uso orquestan puertos; adaptadores (in: Kafka listener; out: Mongo, HTTP clients, Kafka producer, DLT recoverer). |
+| `order-processor` | Java 21, Spring Boot 3.5, spring-kafka, spring-data-mongodb | Worker. Arquitectura hexagonal: dominio puro sin Spring/Kafka/Mongo; casos de uso orquestan puertos; adaptadores (in: Kafka listener; out: Mongo, HTTP clients, Kafka producer). |
 | `products-api` | Go 1.27, net/http, mongo-driver v2 | Catálogo por mercado (contrato 5.C). In-memory para arranque sin credenciales + Mongo con seed. |
 | `clients-api` | NestJS 12, Express, Vitest | Clientes (contrato 5.B). Repositorio en memoria con seed inicial. |
 | Infra | Docker Compose | Kafka + Zookeeper, MongoDB, Kafdrop (9000), Mongo Express (8081). |
@@ -66,8 +65,11 @@ Kafka + MongoDB.
 1. Un productor publica `orders.created.v1` con clave `orderId` (partición por pedido).
 2. El `@KafkaListener` deserializa el payload JSON con `OrderEventJsonReader` (estricto en
    `quantity` entero, sin desconocer campos desconocidos).
-3. Si el payload viola el contrato 5.A: **sin reintentos** → DLT con causa `INPUT_REJECTED`
-   (`ContractViolationException` no reintentable).
+3. Los mensajes que no se pueden resolver se atienden como estados finales (ver §4): un payload no
+   parseable se registra con `recordUnprocessable` (reason `DESERIALIZATION`), conservando la
+   información salvable; las violaciones del contrato 5.A se evalúan en el caso de uso
+   (`OrderContractService`) y se rechazan sin reintentos. Ninguno de los dos pasa por el manejador
+   de errores de Kafka.
 4. El listener construye `ProcessOrderCommand` y llama a `OrderProcessingService.processOrder`:
    - **Idempotencia (7.1):** si `eventId` ya fue procesado, no recalcula; reenvía el resultado si el
      evento vigente es el mismo (at-least-once del lado de salida).
@@ -96,13 +98,21 @@ Kafka + MongoDB.
 | Timeout / red | Falla de red | Transitorio → reintento con backoff exponencial |
 | Otra respuesta no contemplada | Fuera de contrato | Definitivo → `TECHNICAL_FAILURE` persistido + publicado |
 
-- **Backoff:** `ExponentialBackOffWithMaxRetries(3)` (intervalo inicial 1 s, multiplicador 2) y
-  cabecera de `attemptCount` real vía `DELIVERY_ATTEMPT`.
-- **DLT (`orders.processing.dlt`):** al agotar reintentos o ante errores no recuperables. Headers
-  (7): `orderId`, `eventId`, `errorCategory`, `summaryCause`, `attemptCount`, `timestamp`,
-  `component`.
+- **Backoff (Kafka):** `ExponentialBackOffWithMaxRetries(3)` (intervalo inicial 1 s, multiplicador 2).
+- **Backoff (HTTP):** `@Retry` de Resilience4j por adaptador (`resilience4j.retry.instances.clients-api`
+  / `products-api`; 3 intentos, 500 ms ×2 hasta 4 s) reintenta **solo** fallos transitorios
+  (`RetryableExternalServicePredicate`, que respeta la matriz anterior); el `@RateLimiter` (5/s)
+  convierte su rechazo en `429` local transitorio que el `@Retry` exterior reintenta.
+- **Fallo transitorio agotado:** el recoverer (`ProcessingFailureRecoverer`) registra el resultado
+  definitivo con el caso de uso: payload parseable → `TECHNICAL_FAILURE` persistido y publicado
+  (reason `TECHNICAL_FAILURE: <causa raíz>`, totals en cero); payload no parseable →
+  `recordUnprocessable` (reason `RETRIES_EXHAUSTED`). No existe DLT: todo mensaje termina persistido
+  y publicado.
 - **TECHNICAL_FAILURE:** no reintentar un evento definitivamente fallido; se persiste y publica para
   dar trazabilidad (totals en cero en el evento de salida).
+- **No parseable:** los mensajes que no son JSON (ni `quantity` entero en una línea) se registran
+  en el listener con `recordUnprocessable`; el id de pedido/evento se salva del payload, de la clave
+  del registro o de un id sintético `topic-partition-offset`.
 - **Excepción fiscal (6.2):** cliente `EXEMPT` → tasa efectiva 0 %.
 - **Rechazo por catálogo:** `PRODUCT_DISCONTINUED`, `PRODUCT_NOT_FOUND`,
   `CLIENT_NOT_FOUND`, `CLIENT_BLOCKED`, `MARKET_MISMATCH` son razones de `REJECTED`.
@@ -136,5 +146,6 @@ Kafka + MongoDB.
 - Índice `{eventId: 1}` no se crea en arranque (se delega su creación explícita).
 - Los seeds de `clients-api` y `products-api` son estáticos (en memoria y Mongo deben mantenerse en
   sincronía).
-- La DLT es best-effort: si la publicación a DLT falla, se loguea (no se pierde el mensaje original,
-  que permanece en el tópico de origen por el commit no confirmado).
+- La publicación de un estado final es bloqueante y, si Kafka vuelve a fallar, la re-entrega
+  idempotente del mismo evento repite el estado persistido (el mensaje no se pierde: su offset no se
+  confirma hasta persistir y publicar).

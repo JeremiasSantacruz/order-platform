@@ -7,7 +7,7 @@
 
 | Rol | Enfoque | Artefactos que cuida |
 | --- | --- | --- |
-| **Tech lead (orden)** | Arquitectura, decisiones (ADRs), estándares, integración entre servicios | Proposal, ADR-001/002, repositorio raíz, docker-compose |
+| **Tech lead (orden)** | Arquitectura, decisiones (ADRs), estándares, integración entre servicios | Proposal, ADR-001/002/003, repositorio raíz, docker-compose |
 | **Ingeniero A — worker** | `order-processor` (Java/Spring): hexagonales, listener, repositorio, publisher | `order-processor/**`, tests unitarios, IT Testcontainers |
 | **Ingeniero B — catálogo** | `products-api` (Go) + `clients-api` (NestJS) y sus contratos | Módulos de las APIs, seeds, tests de contrato |
 | **Ingeniero C — infra/plataforma** | Docker Compose, CI/CD, entornos, monitoreo (Kafdrop, Mongo Express), observabilidad | `docker-compose.yml`, GitHub Actions, scripts de despliegue |
@@ -35,7 +35,7 @@ Pipeline por PR y por merge a `main`:
 # Pipeline resumido (equivalente en GitHub Actions)
 jobs:
   order-processor:
-    - cd order-processor && ./gradlew test        # 81 tests (unit + IT)
+    - cd order-processor && sh gradlew test        # 104 tests (unit + IT)
     - ./gradlew clean build                        # compila fat jar
   clients-api:
     - cd clients-api && npm ci
@@ -48,7 +48,7 @@ jobs:
     - verificación de shape de respuestas contra 5.B/5.C (mock/vcr o pruebas de contrato)
   docker-smoke:
     - docker compose up --profile full --build      # smoke end-to-end (5.A → 5.D)
-    - verificación de DLT ante un 5xx del catálogo
+    - verificación de un 5xx del catálogo → TECHNICAL_FAILURE persistido y publicado
 ```
 
 **Gates del merge:** los 4 primeros jobs verdes + smoke opcional marcado *required* en `main` +
@@ -64,7 +64,7 @@ revisión humana. **CD:** tag `v*` → build de imágenes → push a registry �
 - **Config externa** vía `env` (nunca hardcode): `KAFKA_BOOTSTRAP_SERVERS`, `MONGO_URI`,
   `CLIENTS_API_BASE_URL`, `PRODUCTS_API_BASE_URL`.
 - **Observabilidad mínima:** logs estructurados SLF4J en el worker; Kafdrop para inspeccionar
-  tópicos/DLT; Mongo Express para inspeccionar `orders`; healthchecks en ambas APIs.
+  tópicos; Mongo Express para inspeccionar `orders`; healthchecks en ambas APIs.
 
 ## 5. Definition of Done (DoD)
 
@@ -76,9 +76,10 @@ Una historia se considera **done** cuando cumple **todas**:
 3. Tests automatizados verdes: unit de cálculo con `BigDecimal`/`HALF_UP`, IT de integración con
    Testcontainers (o skip documentado), e2e API cuando el cambio toca HTTP.
 4. Coherencia de consistencia: escenarios 7.1/7.2/7.3 cubiertos con prueba que demuestre el
-   comportamiento (idempotencia, CAS, DLT).
+   comportamiento (idempotencia, CAS, estados finales).
 5. Si el cambio toca un contrato: actualizados spec + consumidores en el **mismo PR**.
-6. Docker Compose levanta el conjunto (smoke 5.A → 5.D) y la DLT responde a un `404/5xx`.
+6. Docker Compose levanta el conjunto (smoke 5.A → 5.D) y un fallo no recuperable termina en
+   `TECHNICAL_FAILURE`/`REJECTED` persistido y publicado.
 7. Deuda técnica nueva agregada a `implementation-notes.md` con trigger de cierre explícito.
 8. ADR actualizada si la decisión arquitectónica cambia; de lo contrario, referencia a las
    existentes.
@@ -90,9 +91,9 @@ Una historia se considera **done** cuando cumple **todas**:
 | Riesgo | Probabilidad | Impacto | Mitigación |
 | --- | --- | --- | --- |
 | Drift de contrato entre servicios | Media | Alto | Frontera de contrato compartida; pruebas de shape; revisión cruzada del PR |
-| Pérdida/perdida-ventana de eventos | Baja (por diseño) | Medio | ADR-002 B+E; re-entrega idempotente; DLT; revisar outbox si cambian requisitos |
+| Pérdida/perdida-ventana de eventos | Baja (por diseño) | Medio | ADR-002 B+E; re-entrega idempotente; estados finales persistidos; revisar outbox si cambian requisitos |
 | Volumen/contención en Mongo | Baja | Medio | Índice `{eventId:1}` pendiente; CAS por `orderId`; evaluar partición por mercado |
-| Kafka no disponible prolongado | Media | Medio | ACK por registro; proveer retención y política DLT; alerta operativa |
+| Kafka no disponible prolongado | Media | Medio | ACK por registro; retención del tópico de entrada y re-entrega idempotente; alerta operativa |
 | Deuda de tests en catálogo Go | Media | Bajo | Pruebas de handler/usecase en siguiente sprint |
 
 ## 7. Métricas de salud del equipo

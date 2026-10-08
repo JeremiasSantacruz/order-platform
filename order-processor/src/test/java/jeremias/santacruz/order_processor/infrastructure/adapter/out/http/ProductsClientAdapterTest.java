@@ -1,5 +1,10 @@
 package jeremias.santacruz.order_processor.infrastructure.adapter.out.http;
 
+import io.github.resilience4j.ratelimiter.RateLimiter;
+import io.github.resilience4j.ratelimiter.RateLimiterConfig;
+import io.github.resilience4j.ratelimiter.RequestNotPermitted;
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
 import jeremias.santacruz.order_processor.domain.model.product.Product;
 import jeremias.santacruz.order_processor.domain.model.product.ProductStatus;
 import jeremias.santacruz.order_processor.domain.model.product.TaxCategory;
@@ -13,6 +18,7 @@ import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -21,6 +27,8 @@ import java.util.Set;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.springframework.test.web.client.ExpectedCount.once;
+import static org.springframework.test.web.client.ExpectedCount.times;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withStatus;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
@@ -70,6 +78,105 @@ class ProductsClientAdapterTest {
 
         assertThat(products).containsOnlyKeys("PRD-001");
         assertThat(products.get("PRD-001").taxCategory()).isEqualTo(TaxCategory.STANDARD);
+    }
+
+    @Test
+    @DisplayName("RequestNotPermitted del aspecto en un GET → 429 transitorio")
+    void shouldTranslateRequestNotPermittedToRetryable429() {
+        RateLimiter limiter = RateLimiter.of("products-api", RateLimiterConfig.custom()
+                .limitForPeriod(1)
+                .limitRefreshPeriod(Duration.ofMinutes(10))
+                .timeoutDuration(Duration.ofMillis(50))
+                .build());
+
+        assertThatThrownBy(() -> adapter.rateLimitFallback("PRD-001", "MX",
+                RequestNotPermitted.createRequestNotPermitted(limiter)))
+                .isInstanceOfSatisfying(ExternalServiceException.class, ex -> {
+                    assertThat(ex.getStatusCode()).isEqualTo(429);
+                    assertThat(ex.isRetryable()).isTrue();
+                });
+    }
+
+    @Test
+    @DisplayName("Otros fallos pasan por el fallback sin alterarse")
+    void shouldRethrowNonRateLimitFailures() {
+        ExternalServiceException original = ExternalServiceException.forStatus("products-api", 502, "bad gateway");
+
+        assertThatThrownBy(() -> adapter.rateLimitFallback("PRD-001", "MX", original)).isSameAs(original);
+    }
+
+    @Test
+    @DisplayName("El throttling se declara con @RateLimiter sobre ambos métodos del puerto")
+    void shouldBeAnnotatedWithRateLimiter() throws NoSuchMethodException {
+        io.github.resilience4j.ratelimiter.annotation.RateLimiter batch =
+                ProductsClientAdapter.class.getMethod("getProducts", Set.class, String.class)
+                        .getAnnotation(io.github.resilience4j.ratelimiter.annotation.RateLimiter.class);
+        io.github.resilience4j.ratelimiter.annotation.RateLimiter single =
+                ProductsClientAdapter.class.getMethod("getProduct", String.class, String.class)
+                        .getAnnotation(io.github.resilience4j.ratelimiter.annotation.RateLimiter.class);
+
+        assertThat(batch).isNotNull();
+        assertThat(batch.name()).isEqualTo("products-api");
+        assertThat(batch.fallbackMethod()).isEqualTo("rateLimitFallback");
+        assertThat(single).isNotNull();
+    }
+
+    @Test
+    @DisplayName("El reintento HTTP se declara con @Retry sobre ambos métodos del puerto")
+    void shouldBeAnnotatedWithRetry() throws NoSuchMethodException {
+        io.github.resilience4j.retry.annotation.Retry batch =
+                ProductsClientAdapter.class.getMethod("getProducts", Set.class, String.class)
+                        .getAnnotation(io.github.resilience4j.retry.annotation.Retry.class);
+        io.github.resilience4j.retry.annotation.Retry single =
+                ProductsClientAdapter.class.getMethod("getProduct", String.class, String.class)
+                        .getAnnotation(io.github.resilience4j.retry.annotation.Retry.class);
+
+        assertThat(batch).isNotNull();
+        assertThat(batch.name()).isEqualTo("products-api");
+        assertThat(single).isNotNull();
+        assertThat(single.name()).isEqualTo("products-api");
+    }
+
+    @Test
+    @DisplayName("@Retry: el 503 transitorio del lote se reintenta hasta maxAttempts y luego propaga")
+    void shouldRetryTransientFailuresUpToMaxAttempts() {
+        server.expect(times(3), requestTo("http://products.test/products/PRD-001?market=MX"))
+                .andRespond(withStatus(HttpStatus.SERVICE_UNAVAILABLE));
+
+        Retry retry = retryForTest();
+        Set<String> ids = new LinkedHashSet<>(List.of("PRD-001"));
+
+        assertThatThrownBy(() -> Retry.decorateSupplier(retry,
+                () -> adapter.getProducts(ids, "MX")).get())
+                .isInstanceOfSatisfying(ExternalServiceException.class,
+                        ex -> assertThat(ex.isRetryable()).isTrue());
+        server.verify();
+    }
+
+    @Test
+    @DisplayName("@Retry: el 401 definitivo NO se reintenta")
+    void shouldNotRetryDefinitiveFailures() {
+        server.expect(once(), requestTo("http://products.test/products/PRD-001?market=MX"))
+                .andRespond(withStatus(HttpStatus.UNAUTHORIZED));
+
+        Retry retry = retryForTest();
+        Set<String> ids = new LinkedHashSet<>(List.of("PRD-001"));
+
+        assertThatThrownBy(() -> Retry.decorateSupplier(retry,
+                () -> adapter.getProducts(ids, "MX")).get())
+                .isInstanceOfSatisfying(ExternalServiceException.class,
+                        ex -> assertThat(ex.isRetryable()).isFalse());
+        server.verify();
+    }
+
+    /** Simula la instancia {@code resilience4j.retry.instances.products-api.*} para el test. */
+    private static Retry retryForTest() {
+        return Retry.of("products-api", RetryConfig.custom()
+                .maxAttempts(3)
+                .retryOnException(ex -> ex instanceof ExternalServiceException e && e.isRetryable())
+                .intervalFunction(io.github.resilience4j.core.IntervalFunction.of(Duration.ofMillis(10)))
+                .failAfterMaxAttempts(true)
+                .build());
     }
 
     @Test

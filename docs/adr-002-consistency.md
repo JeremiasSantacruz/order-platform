@@ -58,13 +58,15 @@ Garantías que se obtienen:
 
 - **Nunca se confirma el offset de un evento cuyo evento de salida no se publicó.** El lector de
   Kafka (commit por registro, `ack-mode: record`) fuerza `ALBD-once`: cada mensaje se procesa hasta
-  publicar o reintentar (backoff → DLT).
+  publicar o registrar su estado definitivo (backoff → `TECHNICAL_FAILURE`).
 - **Nunca se publica un resultado descartado:** el caso de uso interroga el `eventId` realmente
   persistido (ADR-001) antes de publicar.
 - **La reentrega no duplica efectos:** el reproceso taller 7.1 republica *el estado vigente*, y los
   consumidores de `orders.processed.v1` deduplican por `sourceEventId` (contrato 5.D).
-- **La DLT es la última red:** intentos agotados del mismo evento con fallo definitivo → se persiste
-  `TECHNICAL_FAILURE` (cierre contable) y se publica su evento; la DLT guarda el payload original.
+- **Los fallos definitivos también se publican:** intentos agotados del mismo evento con fallo
+  definitivo → se persiste `TECHNICAL_FAILURE` (cierre contable) y se publica su evento; los
+  payloads ilegibles se registran como `REJECTED` no procesable conservando el payload crudo en
+  `sourcePayload` (ADR-003).
 
 ### ¿Por qué no outbox (C) todavía?
 
@@ -85,7 +87,8 @@ del broker inaceptable, o requisito de cero pérdidas ante indisponibilidad prol
 **Positivas**
 
 - Invariante verificable: `outbox` no existe, pero **todo evento publicado existe persistido**, y
-  **todo resultado persistido tiene su evento emitido** (eventualmente, vía re-entrega o DLT).
+  **todo resultado persistido tiene su evento emitido** (eventualmente, vía re-entrega o
+  re-publicación del estado persistido).
 - Tests deterministas: el orden de efectos (persistir → publicar) se puede probar con mocks sin
   infraestructura.
 
@@ -94,8 +97,10 @@ del broker inaceptable, o requisito de cero pérdidas ante indisponibilidad prol
 - Throughput de consumo limitado por el RTT del broker: aceptable para el dominio.
 - Si Kafka queda caído **más** tiempo que la retención del tópico de entrada, podría perder eventos
   no procesados (cubierto operativamente por el volumen de re-entrega/deduplicación, no por diseño).
-- La semana de cabeza es la DLT: si la publicación a DLT también falla, se loguea el fallo (el
-  payload original nunca se pierde en origen gracias al commit no confirmado opcional de Kafka).
+- El punto crítico es la publicación bloqueante final: si Kafka vuelve a fallar al publicar el
+  estado, se loguea el fallo y el mensaje original queda sin confirmar en el tópico de entrada (el
+  payload nunca se pierde en origen gracias al commit por registro); la re-entrega repite el estado
+  persistido.
 - El pacto de deduplicación por `sourceEventId` pasa a ser un **requisito de contrato** de los
   consumidores de salida (documentado en el contrato 5.D).
 

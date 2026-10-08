@@ -1,6 +1,7 @@
 package jeremias.santacruz.order_processor.domain.service;
 
 import jeremias.santacruz.order_processor.domain.model.client.Client;
+import jeremias.santacruz.order_processor.domain.model.order.EnrichedOrderLine;
 import jeremias.santacruz.order_processor.domain.model.order.Market;
 import jeremias.santacruz.order_processor.domain.model.order.OrderLine;
 import jeremias.santacruz.order_processor.domain.model.order.OrderTotals;
@@ -40,7 +41,7 @@ public class OrderCalculatorService {
             )
     );
 
-    public CalculatedLine calculateLine(OrderLine item, Client client, Product product, Market market) {
+    public EnrichedOrderLine calculateLine(OrderLine item, Client client, Product product, Market market) {
         BigDecimal grossSubtotal = item.unitPrice()
                 .multiply(BigDecimal.valueOf(item.quantity()))
                 .setScale(2, RoundingMode.HALF_UP);
@@ -56,17 +57,19 @@ public class OrderCalculatorService {
         BigDecimal taxAmount = netSubtotal.multiply(taxRate).setScale(2, RoundingMode.HALF_UP);
         BigDecimal lineTotal = netSubtotal.add(taxAmount).setScale(2, RoundingMode.HALF_UP);
 
-        return new CalculatedLine(item.productId(), grossSubtotal, discount, netSubtotal, taxAmount, lineTotal);
+        return new EnrichedOrderLine(item.productId(), item.quantity(), item.unitPrice(),
+                product.name(), product.sku(), product.taxCategory(), taxRate, discountRate,
+                grossSubtotal, discount, netSubtotal, taxAmount, lineTotal);
     }
 
-    public OrderTotals calculateTotals(List<CalculatedLine> lines) {
+    public OrderTotals calculateTotals(List<EnrichedOrderLine> lines) {
         BigDecimal grossSubtotal = BigDecimal.ZERO;
         BigDecimal discount = BigDecimal.ZERO;
         BigDecimal netSubtotal = BigDecimal.ZERO;
         BigDecimal tax = BigDecimal.ZERO;
         BigDecimal grandTotal = BigDecimal.ZERO;
 
-        for (CalculatedLine line : lines) {
+        for (EnrichedOrderLine line : lines) {
             grossSubtotal = grossSubtotal.add(line.grossSubtotal());
             discount = discount.add(line.discount());
             netSubtotal = netSubtotal.add(line.netSubtotal());
@@ -83,15 +86,5 @@ public class OrderCalculatorService {
         }
         return TAX_RATES.getOrDefault(market, Map.of())
                 .getOrDefault(category, BigDecimal.ZERO);
-    }
-
-    public record CalculatedLine(
-            String productId,
-            BigDecimal grossSubtotal,
-            BigDecimal discount,
-            BigDecimal netSubtotal,
-            BigDecimal taxAmount,
-            BigDecimal lineTotal
-    ) {
     }
 }

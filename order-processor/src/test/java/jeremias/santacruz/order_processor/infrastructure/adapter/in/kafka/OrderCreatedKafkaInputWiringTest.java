@@ -10,8 +10,12 @@ import jeremias.santacruz.order_processor.infrastructure.adapter.out.http.Client
 import jeremias.santacruz.order_processor.infrastructure.adapter.out.http.ProductsClientAdapter;
 import jeremias.santacruz.order_processor.infrastructure.adapter.out.kafka.EventPublisherAdapter;
 import jeremias.santacruz.order_processor.infrastructure.adapter.out.mongo.OrderRepositoryAdapter;
+import io.github.resilience4j.ratelimiter.RateLimiterRegistry;
+import io.github.resilience4j.retry.RetryRegistry;
+import jeremias.santacruz.order_processor.domain.port.out.ExternalServiceException;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.aop.support.AopUtils;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.kafka.config.KafkaListenerEndpointRegistry;
@@ -37,13 +41,10 @@ class OrderCreatedKafkaInputWiringTest {
     private OrderCreatedListener listener;
 
     @Autowired
-    private OrderCreatedEventValidator validator;
-
-    @Autowired
     private OrderEventJsonReader reader;
 
     @Autowired
-    private DltPublishingRecoverer recoverer;
+    private ProcessingFailureRecoverer recoverer;
 
     @Autowired
     private DefaultErrorHandler errorHandler;
@@ -63,26 +64,30 @@ class OrderCreatedKafkaInputWiringTest {
     @Autowired
     private OrderRepositoryPort orderRepositoryPort;
 
+    @Autowired
+    private RateLimiterRegistry rateLimiterRegistry;
+
+    @Autowired
+    private RetryRegistry retryRegistry;
+
     @Test
-    @DisplayName("El listener corre en un contenedor con ack-mode record y cabecera de intento")
-    void listenerContainerIsConfiguredForDltMetadata() {
+    @DisplayName("El listener corre en un contenedor con ack-mode record")
+    void listenerContainerIsConfigured() {
         MessageListenerContainer container = registry.getListenerContainer("ordersCreatedListener");
 
         assertThat(container).isNotNull();
         assertThat(listener).isNotNull();
-        assertThat(validator).isNotNull();
         assertThat(reader).isNotNull();
 
         ConcurrentMessageListenerContainer<?, ?> kafkaContainer =
                 (ConcurrentMessageListenerContainer<?, ?>) container;
         ContainerProperties properties = kafkaContainer.getContainerProperties();
         assertThat(properties.getAckMode()).isEqualTo(ContainerProperties.AckMode.RECORD);
-        assertThat(properties.isDeliveryAttemptHeader()).isTrue();
         assertThat(properties.getTopics()).contains("orders.created.v1");
     }
 
     @Test
-    @DisplayName("El manejador de errores de la sección 7 está publicado como bean único")
+    @DisplayName("El manejador de errores está publicado como bean único con el recoverer de reintentos agotados")
     void errorHandlerBeanIsWired() {
         assertThat(errorHandler).isNotNull();
         assertThat(recoverer).isNotNull();
@@ -96,5 +101,30 @@ class OrderCreatedKafkaInputWiringTest {
         assertThat(clientsClientPort).isInstanceOf(ClientsClientAdapter.class);
         assertThat(productsClientPort).isInstanceOf(ProductsClientAdapter.class);
         assertThat(orderRepositoryPort).isInstanceOf(OrderRepositoryAdapter.class);
+    }
+
+    @Test
+    @DisplayName("El throttling @RateLimiter está activo: instancias configuradas y adaptadores con proxy AOP")
+    void rateLimitingIsWired() {
+        assertThat(rateLimiterRegistry.find("clients-api")).isPresent();
+        assertThat(rateLimiterRegistry.find("products-api")).isPresent();
+        assertThat(AopUtils.isAopProxy(clientsClientPort)).isTrue();
+        assertThat(AopUtils.isAopProxy(productsClientPort)).isTrue();
+    }
+
+    @Test
+    @DisplayName("El reintento @Retry está activo: instancias con backoff exponencial y predicado de fallos transitorios")
+    void retryingIsWired() {
+        assertThat(retryRegistry.find("clients-api")).isPresent();
+        assertThat(retryRegistry.find("products-api")).isPresent();
+
+        var config = retryRegistry.find("clients-api").orElseThrow().getRetryConfig();
+        assertThat(config.getMaxAttempts()).isEqualTo(3);
+        assertThat(config.getIntervalBiFunction()).isNotNull();
+
+        var predicate = config.getExceptionPredicate();
+        assertThat(predicate).isNotNull();
+        assertThat(predicate.test(ExternalServiceException.forStatus("clients-api", 503, "upstream down"))).isTrue();
+        assertThat(predicate.test(ExternalServiceException.forStatus("clients-api", 401, "unauthorized"))).isFalse();
     }
 }

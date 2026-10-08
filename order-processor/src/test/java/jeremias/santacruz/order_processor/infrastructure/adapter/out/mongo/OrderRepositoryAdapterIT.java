@@ -1,12 +1,18 @@
 package jeremias.santacruz.order_processor.infrastructure.adapter.out.mongo;
 
 import com.mongodb.client.MongoClients;
+import jeremias.santacruz.order_processor.domain.model.client.Client;
+import jeremias.santacruz.order_processor.domain.model.client.ClientSegment;
+import jeremias.santacruz.order_processor.domain.model.client.ClientStatus;
+import jeremias.santacruz.order_processor.domain.model.client.TaxRegime;
 import jeremias.santacruz.order_processor.domain.model.order.Currency;
+import jeremias.santacruz.order_processor.domain.model.order.EnrichedOrderLine;
 import jeremias.santacruz.order_processor.domain.model.order.Market;
 import jeremias.santacruz.order_processor.domain.model.order.Order;
 import jeremias.santacruz.order_processor.domain.model.order.OrderLine;
 import jeremias.santacruz.order_processor.domain.model.order.OrderStatus;
 import jeremias.santacruz.order_processor.domain.model.order.OrderTotals;
+import jeremias.santacruz.order_processor.domain.model.product.TaxCategory;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -58,7 +64,8 @@ class OrderRepositoryAdapterIT {
         Order order = new Order(orderId, eventId, eventVersion, Market.MX, Currency.MXN, "CLI-99821",
                 List.of(new OrderLine("PRD-001", 24, new BigDecimal("35.5"))), Instant.now());
         order.approve(new OrderTotals(new BigDecimal("852.00"), BigDecimal.ZERO,
-                new BigDecimal("852.00"), new BigDecimal("136.32"), new BigDecimal("988.32")), Instant.now());
+                new BigDecimal("852.00"), new BigDecimal("136.32"), new BigDecimal("988.32")),
+                List.of(), null, Instant.now());
         return order;
     }
 
@@ -128,5 +135,39 @@ class OrderRepositoryAdapterIT {
 
         assertThat(resolved.getOrderId()).isEqualTo("ORD-1");
         assertThat(adapter.existsByEventId("evt-A")).isTrue();
+    }
+
+    @Test
+    @DisplayName("Persiste y recupera snapshot de cliente, líneas enriquecidas y payload crudo")
+    void shouldRoundTripSnapshotAndUnprocessableFields() {
+        Client client = new Client("CLI-99821", "Cliente A", ClientStatus.ACTIVE, ClientSegment.WHOLESALE,
+                TaxRegime.GENERAL, Market.MX);
+        Order approved = order("evt-3", 3L, "ORD-3");
+        EnrichedOrderLine line = new EnrichedOrderLine("PRD-001", 24, new BigDecimal("35.5"),
+                "Refresco", "SKU-1", TaxCategory.STANDARD, new BigDecimal("0.16"), BigDecimal.ZERO,
+                new BigDecimal("852.00"), BigDecimal.ZERO, new BigDecimal("852.00"),
+                new BigDecimal("136.32"), new BigDecimal("988.32"));
+        approved.approve(approved.getTotals(), List.of(line), client, Instant.now());
+
+        adapter.save(approved);
+
+        Order stored = adapter.findByOrderId("ORD-3").orElseThrow();
+        assertThat(stored.getClient()).isEqualTo(client);
+        assertThat(stored.getEnrichedLines()).hasSize(1);
+        assertThat(stored.getEnrichedLines().get(0).productName()).isEqualTo("Refresco");
+        assertThat(stored.getEnrichedLines().get(0).lineTotal()).isEqualByComparingTo("988.32");
+
+        // Mensaje no procesable: esqueleto parcial con payload crudo conservado.
+        Order partial = Order.partial("UNPARSEABLE-UNK-0", "evt-4", 0L, null, null, null,
+                List.of(), Instant.now());
+        partial.setSourcePayload("{\"rotto\":true}");
+        partial.reject("DESERIALIZATION: JSON inválido", Instant.now());
+
+        adapter.save(partial);
+
+        Order storedPartial = adapter.findByOrderId("UNPARSEABLE-UNK-0").orElseThrow();
+        assertThat(storedPartial.getStatus()).isEqualTo(OrderStatus.REJECTED);
+        assertThat(storedPartial.getMarket()).isNull();
+        assertThat(storedPartial.getSourcePayload()).isEqualTo("{\"rotto\":true}");
     }
 }

@@ -25,7 +25,7 @@ type Product struct {
 	Sku         string      `json:"sku"`
 	Status      Status      `json:"status"`
 	TaxCategory TaxCategory `json:"taxCategory"`
-	Market      string      `json:"-"` 
+	Market      string      `json:"-"`
 }
 
 type ProductRepository interface {

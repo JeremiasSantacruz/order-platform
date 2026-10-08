@@ -36,31 +36,30 @@ public class OrderEventJsonReader {
      *
      * @param payload Mensaje crudo consumido del tópico
      * @return evento de entrada ya tipado
-     * @throws ContractViolationException con categoría {@code DESERIALIZATION} si el payload
-     *         no es JSON válido ni ajustado al esquema
+     * @throws IllegalArgumentException si el payload no es JSON válido ni ajustado al esquema
+     *         (el listener lo traduce a un pedido {@code REJECTED} con la razón
+     *         {@code DESERIALIZATION ...})
      */
     public OrderCreatedEventDto readEvent(String payload) {
         if (payload == null || payload.isBlank()) {
-            throw new ContractViolationException(ContractViolationException.Category.DESERIALIZATION,
-                    "payload vacío");
+            throw new IllegalArgumentException("payload vacío");
         }
         try {
             OrderCreatedEventDto event = mapper.readValue(payload, OrderCreatedEventDto.class);
             if (event == null) {
-                throw new ContractViolationException(ContractViolationException.Category.DESERIALIZATION,
-                        "payload JSON nulo");
+                throw new IllegalArgumentException("payload JSON nulo");
             }
             return event;
         }
         catch (JsonProcessingException | IllegalArgumentException ex) {
-            throw new ContractViolationException(ContractViolationException.Category.DESERIALIZATION,
-                    "JSON inválido: " + describe(ex));
+            throw new IllegalArgumentException("JSON inválido: " + describe(ex));
         }
     }
 
     /**
-     * Lee de forma no bloqueante un campo de texto del payload, para conservar el identificador
-     * del mensaje en los headers de la DLT aunque no se pueda deserializar completo.
+     * Lee de forma no bloqueante un campo de texto del payload, para conservar los identificadores
+     * del mensaje aunque el JSON no sea deserializable por completo (salvage de los ids en los
+     * caminos de entrada fallida).
      *
      * @param payload Mensaje crudo
      * @param field   Nombre del campo

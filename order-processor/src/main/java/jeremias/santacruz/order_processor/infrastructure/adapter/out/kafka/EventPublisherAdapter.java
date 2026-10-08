@@ -5,16 +5,12 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import jeremias.santacruz.order_processor.domain.model.order.Order;
 import jeremias.santacruz.order_processor.domain.model.order.OrderTotals;
 import jeremias.santacruz.order_processor.domain.port.out.EventPublisherPort;
-import org.apache.kafka.clients.producer.ProducerRecord;
-import org.apache.kafka.common.header.Headers;
-import org.apache.kafka.common.header.internals.RecordHeader;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.kafka.core.KafkaTemplate;
 import org.springframework.stereotype.Component;
 
-import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeUnit;
@@ -22,30 +18,17 @@ import java.util.concurrent.TimeoutException;
 
 /**
  * Adaptador de salida Kafka: publica el resultado del pedido en {@code orders.processed.v1}
- * (sección 5.D) y los mensajes fallidos en la DLT {@code orders.processing.dlt} con los headers
- * de metadatos de la sección 7.
+ * (sección 5.D). Es el único destino de salida: no existe DLT, todo resultado se publica aquí.
  *
- * <p>Las publicaciones de resultado son <b>bloqueantes</b>: si Kafka no acepta el mensaje, la
- * excepción escala al contenedor, el offset no se confirma y la re-entrega vuelve a intentarlo
- * (la ruta idempotente del caso de uso reenvía el resultado ya persistido). Es la semántica
- * at-least-once elegida para la consistencia Mongo ↔ Kafka (ver ADR-002).</p>
- *
- * <p>La publicación en la DLT sí se traga y se loguea: fallar dentro del recoverer causaría un
- * bucle de reentrega con el broker caído.</p>
+ * <p>Las publicaciones son <b>bloqueantes</b>: si Kafka no acepta el mensaje, la excepción escala
+ * al contenedor, el offset no se confirma y la re-entrega vuelve a intentarlo (la ruta idempotente
+ * del caso de uso reenvía el resultado ya persistido). Es la semántica at-least-once elegida para
+ * la consistencia Mongo ↔ Kafka (ver ADR-002).</p>
  */
 @Component
 public class EventPublisherAdapter implements EventPublisherPort {
 
     private static final Logger log = LoggerFactory.getLogger(EventPublisherAdapter.class);
-
-    /** Headers de metadatos exigidos por la sección 7 para la DLT. */
-    static final String HEADER_ORDER_ID = "orderId";
-    static final String HEADER_EVENT_ID = "eventId";
-    static final String HEADER_ERROR_CATEGORY = "errorCategory";
-    static final String HEADER_SUMMARY_CAUSE = "summaryCause";
-    static final String HEADER_ATTEMPT_COUNT = "attemptCount";
-    static final String HEADER_TIMESTAMP = "timestamp";
-    static final String HEADER_COMPONENT = "component";
 
     /** Versión del contrato del tópico de salida {@code orders.processed.v1}. */
     private static final long OUTPUT_EVENT_VERSION = 1L;
@@ -55,19 +38,13 @@ public class EventPublisherAdapter implements EventPublisherPort {
     private final KafkaTemplate<String, String> kafkaTemplate;
     private final ObjectMapper objectMapper;
     private final String processedTopic;
-    private final String dltTopic;
-    private final String component;
 
     public EventPublisherAdapter(KafkaTemplate<String, String> kafkaTemplate,
                                  ObjectMapper objectMapper,
-                                 @Value("${app.kafka.topics.orders-processed:orders.processed.v1}") String processedTopic,
-                                 @Value("${app.kafka.topics.orders-created-dlt:orders.processing.dlt}") String dltTopic,
-                                 @Value("${spring.application.name:order-processor}") String component) {
+                                 @Value("${app.kafka.topics.orders-processed:orders.processed.v1}") String processedTopic) {
         this.kafkaTemplate = kafkaTemplate;
         this.objectMapper = objectMapper;
         this.processedTopic = processedTopic;
-        this.dltTopic = dltTopic;
-        this.component = component;
     }
 
     @Override
@@ -92,34 +69,13 @@ public class EventPublisherAdapter implements EventPublisherPort {
         }
     }
 
-    @Override
-    public void publishToDLT(String rawPayload, DeadLetterInfo info) {
-        ProducerRecord<String, String> record = new ProducerRecord<>(dltTopic, info.orderId(), rawPayload);
-        Headers headers = record.headers();
-        addHeader(headers, HEADER_ORDER_ID, info.orderId());
-        addHeader(headers, HEADER_EVENT_ID, info.eventId());
-        addHeader(headers, HEADER_ERROR_CATEGORY, info.errorCategory());
-        addHeader(headers, HEADER_SUMMARY_CAUSE, truncate(info.summaryCause()));
-        addHeader(headers, HEADER_ATTEMPT_COUNT, Integer.toString(info.attemptCount()));
-        addHeader(headers, HEADER_TIMESTAMP, info.timestamp().toString());
-        addHeader(headers, HEADER_COMPONENT, info.component());
-
-        try {
-            kafkaTemplate.send(record).get(SEND_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-            log.warn("Mensaje eventId={} orderId={} enviado a la DLT '{}' (errorCategory={}, attemptCount={})",
-                    info.eventId(), info.orderId(), dltTopic, info.errorCategory(), info.attemptCount());
-        }
-        catch (InterruptedException ex) {
-            Thread.currentThread().interrupt();
-            log.error("Interrupción publicando en la DLT '{}': {}", dltTopic, ex.getMessage());
-        }
-        catch (ExecutionException | TimeoutException ex) {
-            log.error("No fue posible publicar en la DLT '{}' el eventId={} orderId={}: {}", dltTopic,
-                    info.eventId(), info.orderId(), ex.getMessage());
-        }
-    }
-
-    /** Mapeo del agregado de dominio al contrato de salida (5.D). */
+    /**
+     * Mapeo del agregado de dominio al contrato de salida (5.D).
+     *
+     * <p>El contrato no cambia: un pedido rechazado por payload ilegible o por contrato puede
+     * venir con {@code market}/{@code currency} desconocidos, y esos campos se publican en
+     * {@code null} en lugar de romper la serialización.</p>
+     */
     private OrderProcessedEventDto toEvent(Order order) {
         OrderTotals totals = order.getTotals() != null ? order.getTotals() : OrderTotals.zero();
         return new OrderProcessedEventDto(
@@ -129,8 +85,8 @@ public class EventPublisherAdapter implements EventPublisherPort {
                 order.getEventId(),
                 order.getOrderId(),
                 order.getStatus().name(),
-                order.getMarket().name(),
-                order.getCurrency().name(),
+                order.getMarket() == null ? null : order.getMarket().name(),
+                order.getCurrency() == null ? null : order.getCurrency().name(),
                 new OrderProcessedEventDto.TotalsDto(
                         totals.grossSubtotal(), totals.discount(), totals.netSubtotal(),
                         totals.tax(), totals.grandTotal()),
@@ -152,19 +108,5 @@ public class EventPublisherAdapter implements EventPublisherPort {
         catch (TimeoutException ex) {
             throw new IllegalStateException("Timeout al publicar en '" + topic + "'", ex);
         }
-    }
-
-    private static void addHeader(Headers headers, String name, String value) {
-        if (value == null) {
-            value = "";
-        }
-        headers.add(new RecordHeader(name, value.getBytes(StandardCharsets.UTF_8)));
-    }
-
-    private static String truncate(String value) {
-        if (value == null) {
-            return "";
-        }
-        return value.length() <= 500 ? value : value.substring(0, 500);
     }
 }

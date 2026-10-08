@@ -1,10 +1,10 @@
 package http
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
-	"context"
 	"products-api/internal/application"
 	"products-api/internal/domain"
 )

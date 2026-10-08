@@ -54,7 +54,7 @@ final class OrderEventFixtures {
         return validPayload().replace("  \"orderId\": \"ORD-MX-000147\",\n", "");
     }
 
-    /** Regla 4: {@code quantity} decimal se rechaza al deserializar (debe ser entero). */
+    /** Regla 4: {@code quantity} decimal; la rechaza el contrato del caso de uso. */
     static String fractionalQuantityPayload() {
         return validPayload().replace("\"quantity\": 24", "\"quantity\": 24.5");
     }

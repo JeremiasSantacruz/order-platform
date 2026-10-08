@@ -1,5 +1,10 @@
 package jeremias.santacruz.order_processor.infrastructure.adapter.out.http;
 
+import io.github.resilience4j.ratelimiter.RateLimiter;
+import io.github.resilience4j.ratelimiter.RateLimiterConfig;
+import io.github.resilience4j.ratelimiter.RequestNotPermitted;
+import io.github.resilience4j.retry.Retry;
+import io.github.resilience4j.retry.RetryConfig;
 import jeremias.santacruz.order_processor.domain.model.client.Client;
 import jeremias.santacruz.order_processor.domain.model.client.ClientSegment;
 import jeremias.santacruz.order_processor.domain.model.client.ClientStatus;
@@ -15,10 +20,13 @@ import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
 
 import java.io.IOException;
+import java.time.Duration;
 import java.util.Optional;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.springframework.test.web.client.ExpectedCount.once;
+import static org.springframework.test.web.client.ExpectedCount.times;
 import static org.springframework.test.web.client.match.MockRestRequestMatchers.requestTo;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withStatus;
 import static org.springframework.test.web.client.response.MockRestResponseCreators.withSuccess;
@@ -62,6 +70,90 @@ class ClientsClientAdapterTest {
         server.expect(requestTo(URL)).andRespond(withStatus(HttpStatus.NOT_FOUND));
 
         assertThat(adapter.getClient("CLI-99821")).isEmpty();
+    }
+
+    @Test
+    @DisplayName("RequestNotPermitted del aspecto → ExternalServiceException 429 reintentable")
+    void shouldTranslateRequestNotPermittedToRetryable429() {
+        RateLimiter limiter = RateLimiter.of("clients-api", RateLimiterConfig.custom()
+                .limitForPeriod(1)
+                .limitRefreshPeriod(Duration.ofMinutes(10))
+                .timeoutDuration(Duration.ofMillis(50))
+                .build());
+
+        assertThatThrownBy(() -> adapter.rateLimitFallback("CLI-99821",
+                RequestNotPermitted.createRequestNotPermitted(limiter)))
+                .isInstanceOfSatisfying(ExternalServiceException.class, ex -> {
+                    assertThat(ex.getStatusCode()).isEqualTo(429);
+                    assertThat(ex.isRetryable()).isTrue();
+                });
+    }
+
+    @Test
+    @DisplayName("Otros fallos pasan por el fallback sin alterarse")
+    void shouldRethrowNonRateLimitFailures() {
+        ExternalServiceException original = ExternalServiceException.forStatus("clients-api", 503, "upstream down");
+
+        assertThatThrownBy(() -> adapter.rateLimitFallback("CLI-99821", original)).isSameAs(original);
+    }
+
+    @Test
+    @DisplayName("El throttling se declara con @RateLimiter sobre el método del puerto")
+    void shouldBeAnnotatedWithRateLimiter() throws NoSuchMethodException {
+        io.github.resilience4j.ratelimiter.annotation.RateLimiter annotation =
+                ClientsClientAdapter.class.getMethod("getClient", String.class)
+                        .getAnnotation(io.github.resilience4j.ratelimiter.annotation.RateLimiter.class);
+
+        assertThat(annotation).isNotNull();
+        assertThat(annotation.name()).isEqualTo("clients-api");
+        assertThat(annotation.fallbackMethod()).isEqualTo("rateLimitFallback");
+    }
+
+    @Test
+    @DisplayName("El reintento HTTP se declara con @Retry sobre el método del puerto")
+    void shouldBeAnnotatedWithRetry() throws NoSuchMethodException {
+        io.github.resilience4j.retry.annotation.Retry annotation =
+                ClientsClientAdapter.class.getMethod("getClient", String.class)
+                        .getAnnotation(io.github.resilience4j.retry.annotation.Retry.class);
+
+        assertThat(annotation).isNotNull();
+        assertThat(annotation.name()).isEqualTo("clients-api");
+    }
+
+    @Test
+    @DisplayName("@Retry: el 503 transitorio se reintenta hasta maxAttempts y luego propaga")
+    void shouldRetryTransientFailuresUpToMaxAttempts() {
+        server.expect(times(3), requestTo(URL)).andRespond(withStatus(HttpStatus.SERVICE_UNAVAILABLE));
+
+        Retry retry = retryForTest();
+
+        assertThatThrownBy(() -> Retry.decorateSupplier(retry, () -> adapter.getClient("CLI-99821")).get())
+                .isInstanceOfSatisfying(ExternalServiceException.class,
+                        ex -> assertThat(ex.isRetryable()).isTrue());
+        server.verify();
+    }
+
+    @Test
+    @DisplayName("@Retry: el 401 definitivo NO se reintenta")
+    void shouldNotRetryDefinitiveFailures() {
+        server.expect(once(), requestTo(URL)).andRespond(withStatus(HttpStatus.UNAUTHORIZED));
+
+        Retry retry = retryForTest();
+
+        assertThatThrownBy(() -> Retry.decorateSupplier(retry, () -> adapter.getClient("CLI-99821")).get())
+                .isInstanceOfSatisfying(ExternalServiceException.class,
+                        ex -> assertThat(ex.isRetryable()).isFalse());
+        server.verify();
+    }
+
+    /** Simula la instancia {@code resilience4j.retry.instances.clients-api.*} para el test. */
+    private static Retry retryForTest() {
+        return Retry.of("clients-api", RetryConfig.custom()
+                .maxAttempts(3)
+                .retryOnException(ex -> ex instanceof ExternalServiceException e && e.isRetryable())
+                .intervalFunction(io.github.resilience4j.core.IntervalFunction.of(Duration.ofMillis(10)))
+                .failAfterMaxAttempts(true)
+                .build());
     }
 
     @Test

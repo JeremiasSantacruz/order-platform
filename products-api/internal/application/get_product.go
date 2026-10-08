@@ -2,8 +2,8 @@ package application
 
 import (
 	"context"
-	"strings"
 	"products-api/internal/domain"
+	"strings"
 )
 
 type GetProductUseCase struct {

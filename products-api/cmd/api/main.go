@@ -13,13 +13,13 @@ import (
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
 
-"products-api/internal/application"
+	"products-api/internal/application"
 	appHTTP "products-api/internal/infrastructure/http"
 	"products-api/internal/infrastructure/mongodb"
 )
 
 func main() {
-  client, db := connectDB()
+	client, db := connectDB()
 
 	// Nos aseguramos de desconectar la BD solo cuando finalice main()
 	defer func() {
@@ -31,7 +31,7 @@ func main() {
 			log.Println("MongoDB client disconnected successfully.")
 		}
 	}()
-  ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	repo := mongodb.NewProductRepository(db)
 	if err := repo.EnsureIndexesAndSeed(ctx); err != nil {
@@ -54,7 +54,6 @@ func main() {
 
 	shutdownChan := make(chan os.Signal, 1)
 	signal.Notify(shutdownChan, os.Interrupt, syscall.SIGTERM)
-
 
 	go func() {
 		log.Printf("Products API running on port %s", server.Addr)

@@ -25,3 +25,6 @@ replay_pid*
 
 # IDE
 .idea/
+
+# Binario local de la herramienta de verificación Kafka
+scripts/kafka-verify/kafka-verify

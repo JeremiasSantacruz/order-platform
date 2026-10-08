@@ -5,6 +5,7 @@ import jeremias.santacruz.order_processor.domain.model.client.Client;
 import jeremias.santacruz.order_processor.domain.model.client.ClientSegment;
 import jeremias.santacruz.order_processor.domain.model.client.ClientStatus;
 import jeremias.santacruz.order_processor.domain.model.client.TaxRegime;
+import jeremias.santacruz.order_processor.domain.model.order.EnrichedOrderLine;
 import jeremias.santacruz.order_processor.domain.model.order.Market;
 import jeremias.santacruz.order_processor.domain.model.order.OrderLine;
 import jeremias.santacruz.order_processor.domain.model.order.OrderTotals;
@@ -117,14 +118,18 @@ class OrderCalculatorServiceTest {
         @Test
         @DisplayName("Debe redondear importes a 2 decimales usando HALF_UP y sumar totales correctamente")
         void shouldRoundLineItemsAndAggregateTotalsCorrectly() {
-            // Línea 1
-            var line1 = new OrderCalculatorService.CalculatedLine(
-                    "P1", new BigDecimal("99.99"), BigDecimal.ZERO, new BigDecimal("99.99"), new BigDecimal("16.00"), new BigDecimal("115.99")
+            // Línea 1: 99.99 neto, 16.00 impuesto, 115.99 total
+            var line1 = new EnrichedOrderLine(
+                    "P1", 1, new BigDecimal("99.99"), "Producto 1", "SKU-1", TaxCategory.STANDARD,
+                    new BigDecimal("0.16"), BigDecimal.ZERO, new BigDecimal("99.99"), BigDecimal.ZERO,
+                    new BigDecimal("99.99"), new BigDecimal("16.00"), new BigDecimal("115.99")
             );
 
-            // Línea 2
-            var line2 = new OrderCalculatorService.CalculatedLine(
-                    "P2", new BigDecimal("21.10"), BigDecimal.ZERO, new BigDecimal("21.10"), new BigDecimal("3.38"), new BigDecimal("24.48")
+            // Línea 2: 21.10 neto, 3.38 impuesto, 24.48 total
+            var line2 = new EnrichedOrderLine(
+                    "P2", 1, new BigDecimal("21.10"), "Producto 2", "SKU-2", TaxCategory.STANDARD,
+                    new BigDecimal("0.16"), BigDecimal.ZERO, new BigDecimal("21.10"), BigDecimal.ZERO,
+                    new BigDecimal("21.10"), new BigDecimal("3.38"), new BigDecimal("24.48")
             );
 
             OrderTotals totals = calculator.calculateTotals(List.of(line1, line2));

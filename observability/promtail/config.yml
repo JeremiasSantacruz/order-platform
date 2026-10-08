@@ -1,0 +1,36 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: docker
+    docker_sd_configs:
+      - host: unix:///var/run/docker.sock
+        refresh_interval: 5s
+    relabel_configs:
+      # Contenedor sin el prefijo "/" de Docker.
+      - source_labels: ['__meta_docker_container_name']
+        regex: '/(.*)'
+        target_label: 'container'
+      # Servicio de docker-compose (order-processor, clients-api, ...).
+      - source_labels: ['__meta_docker_container_label_com_docker_compose_service']
+        target_label: 'service'
+      - source_labels: ['__meta_docker_container_log_stream']
+        target_label: 'stream'
+    pipeline_stages:
+      # Desenvuelve el formato json-file de Docker ({"log": "...", "stream": ...}).
+      # Las líneas que no son de ese formato fallan y pasan sin cambios.
+      - docker: {}
+      # Extrae "level" (solo existe en los logs JSON de order-processor) como label
+      # de baja cardinalidad para poder filtrar WARN/ERROR en LogQL.
+      - json:
+          expressions:
+            level: level
+      - labels:
+          level:

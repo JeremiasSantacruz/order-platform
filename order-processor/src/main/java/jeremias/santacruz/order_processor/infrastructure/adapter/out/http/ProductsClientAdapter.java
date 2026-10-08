@@ -1,5 +1,8 @@
 package jeremias.santacruz.order_processor.infrastructure.adapter.out.http;
 
+import io.github.resilience4j.ratelimiter.RequestNotPermitted;
+import io.github.resilience4j.ratelimiter.annotation.RateLimiter;
+import io.github.resilience4j.retry.annotation.Retry;
 import jeremias.santacruz.order_processor.domain.model.product.Product;
 import jeremias.santacruz.order_processor.domain.model.product.ProductStatus;
 import jeremias.santacruz.order_processor.domain.model.product.TaxCategory;
@@ -23,6 +26,14 @@ import java.util.Set;
  * (la spec no define endpoint de lote). Un {@code 404} deja el producto fuera del mapa, lo que el
  * caso de uso clasifica como {@code PRODUCT_NOT_FOUND}; cualquier fallo transitorio interrumpe el
  * lote completo para reintentar el mensaje con todo el contexto.</p>
+ *
+ * <p>El throttling es declarativo ({@link RateLimiter}, propiedades {@code resilience4j.ratelimiter.instances.products-api.*}).
+ * Cada GET individual y cada lote consumen un permiso; el {@code fallbackMethod} traduce el {@link RequestNotPermitted}
+ * del aspecto a un {@code 429} local transitorio y re-lanza intacto cualquier otro fallo.</p>
+ *
+ * <p>El reintento HTTP es declarativo ({@link Retry}, propiedades {@code resilience4j.retry.instances.products-api.*}):
+ * se reintentan con backoff exponencial solo los fallos transitorios
+ * ({@code RetryableExternalServicePredicate}); los definitivos se propagan intactos.</p>
  */
 @Component
 public class ProductsClientAdapter implements ProductsClientPort {
@@ -36,6 +47,8 @@ public class ProductsClientAdapter implements ProductsClientPort {
     }
 
     @Override
+    @Retry(name = "products-api")
+    @RateLimiter(name = "products-api", fallbackMethod = "rateLimitFallback")
     public Map<String, Product> getProducts(Set<String> productIds, String market) {
         Map<String, Product> products = new LinkedHashMap<>();
         for (String productId : productIds) {
@@ -45,6 +58,8 @@ public class ProductsClientAdapter implements ProductsClientPort {
     }
 
     @Override
+    @Retry(name = "products-api")
+    @RateLimiter(name = "products-api", fallbackMethod = "rateLimitFallback")
     public Optional<Product> getProduct(String productId, String market) {
         ProductResponse response;
         try {
@@ -69,6 +84,31 @@ public class ProductsClientAdapter implements ProductsClientPort {
                     "Respuesta vacía de GET /products/" + productId);
         }
         return Optional.of(toDomain(response, productId));
+    }
+
+    /** Fallback del lote: {@link RequestNotPermitted} → 429 transitorio; el resto se re-lanza intacto. */
+    public Map<String, Product> rateLimitFallback(Set<String> productIds, String market, Throwable ex) {
+        rateLimitRethrow(productIds, market, ex);
+        throw new IllegalStateException("rethrow incondicional", ex);
+    }
+
+    /** Fallback del GET individual: {@link RequestNotPermitted} → 429 transitorio; el resto se re-lanza intacto. */
+    public Optional<Product> rateLimitFallback(String productId, String market, Throwable ex) {
+        rateLimitRethrow(productId, market, ex);
+        throw new IllegalStateException("rethrow incondicional", ex);
+    }
+
+    /** El token bucket agotado (tras {@code timeout-duration}) se comporta como un 429 transitorio. */
+    private void rateLimitRethrow(Object subject, String market, Throwable ex) {
+        if (ex instanceof RequestNotPermitted) {
+            throw new ExternalServiceException(SERVICE, 429, true,
+                    "Rate limit de " + SERVICE + " alcanzado al invocar GET /products/" + subject
+                            + "?market=" + market + ": " + ex.getMessage());
+        }
+        if (ex instanceof RuntimeException runtime) {
+            throw runtime;
+        }
+        throw new ExternalServiceException(SERVICE, null, true, "Fallo inesperado: " + ex.getMessage());
     }
 
     /** Mapea la respuesta 200 (5.C) al modelo de dominio; los enums fuera del contrato son definitivos. */

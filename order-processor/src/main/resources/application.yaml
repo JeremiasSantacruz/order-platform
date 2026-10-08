@@ -9,12 +9,12 @@ spring:
       group-id: ${KAFKA_CONSUMER_GROUP:order-processor}
       auto-offset-reset: earliest
       enable-auto-commit: false
-      # El payload se consume como String crudo: conserva el original para la DLT y
-      # permite clasificar los errores de contrato en el listener.
+      # El payload se consume como String crudo: conserva el original para trazar mensajes que no
+      # pudieron procesarse y permite clasificar los errores de deserialización en el listener.
       key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
       value-deserializer: org.apache.kafka.common.serialization.StringDeserializer
     producer:
-      # Serializadores para las dos salidas Kafka: orders.processed.v1 y la DLT.
+      # Serializadores para la salida Kafka orders.processed.v1.
       key-serializer: org.apache.kafka.common.serialization.StringSerializer
       value-serializer: org.apache.kafka.common.serialization.StringSerializer
     listener:
@@ -26,15 +26,44 @@ spring:
     mongodb:
       uri: ${MONGO_URI:mongodb://localhost:27017/orders_db}
 
-# Contratos de la sección 5 de Expecificaciones.md
+resilience4j:
+  ratelimiter:
+    instances:
+      clients-api:
+        limit-for-period: 5
+        limit-refresh-period: 1s
+        timeout-duration: 1s
+      products-api:
+        limit-for-period: 5
+        limit-refresh-period: 1s
+        timeout-duration: 1s
+  retry:
+    instances:
+      clients-api:
+        max-attempts: 3
+        wait-duration: 500ms
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2.0
+        exponential-max-wait-duration: 4s
+        fail-after-max-attempts: true
+        retry-exception-predicate: jeremias.santacruz.order_processor.infrastructure.config.RetryableExternalServicePredicate
+      products-api:
+        max-attempts: 3
+        wait-duration: 500ms
+        enable-exponential-backoff: true
+        exponential-backoff-multiplier: 2.0
+        exponential-max-wait-duration: 4s
+        fail-after-max-attempts: true
+        retry-exception-predicate: jeremias.santacruz.order_processor.infrastructure.config.RetryableExternalServicePredicate
+
 app:
   kafka:
     topics:
       orders-created: orders.created.v1
-      orders-created-dlt: orders.processing.dlt
       orders-processed: orders.processed.v1
     consumer:
-      # Reintentos con backoff exponencial para fallos transitorios (429/5xx/timeout).
+      # Reintentos con backoff exponencial para fallos transitorios (429/5xx/timeout);
+      # al agotarlos, el mensaje se registra como TECHNICAL_FAILURE persistido y publicado.
       max-retries: 3
 
   # --- Interfaz de salida HTTP (secciones 5.B y 5.C) ------------------------------

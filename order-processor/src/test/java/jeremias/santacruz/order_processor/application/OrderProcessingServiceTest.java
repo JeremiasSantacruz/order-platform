@@ -13,6 +13,7 @@ import jeremias.santacruz.order_processor.domain.model.order.OrderTotals;
 import jeremias.santacruz.order_processor.domain.model.product.Product;
 import jeremias.santacruz.order_processor.domain.model.product.ProductStatus;
 import jeremias.santacruz.order_processor.domain.model.product.TaxCategory;
+import jeremias.santacruz.order_processor.domain.port.in.ProcessOrderUseCase;
 import jeremias.santacruz.order_processor.domain.port.in.ProcessOrderUseCase.OrderLineCommand;
 import jeremias.santacruz.order_processor.domain.port.in.ProcessOrderUseCase.ProcessOrderCommand;
 import jeremias.santacruz.order_processor.domain.port.out.ClientsClientPort;
@@ -43,8 +44,8 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Tests del caso de uso: orquestación de puertos, reglas de elegibilidad/cálculo (sección 6)
- * e idempotencia/control de versión (sección 7). Los servicios de dominio se usan reales porque
+ * Tests del caso de uso: orquestación de puertos, reglas de elegibilidad/cálculo
+ * e idempotencia/control de versión. Los servicios de dominio se usan reales porque
  * son lógica pura; solo se mockean los puertos de infraestructura.
  */
 class OrderProcessingServiceTest {
@@ -131,7 +132,7 @@ class OrderProcessingServiceTest {
     @DisplayName("7.1: la re-entrega del mismo eventId no duplica efectos ni vuelve a consultar")
     void shouldSkipWhenEventIdAlreadyProcessed() {
         Order existing = orderFixture(EVENT_ID, 1L);
-        existing.approve(OrderTotals.zero(), Instant.now());
+        existing.approve(OrderTotals.zero(), List.of(), null, Instant.now());
         when(orderRepositoryPort.existsByEventId(EVENT_ID)).thenReturn(true);
         when(orderRepositoryPort.findByOrderId(ORDER_ID)).thenReturn(Optional.of(existing));
 
@@ -296,5 +297,78 @@ class OrderProcessingServiceTest {
         ArgumentCaptor<Order> saved = ArgumentCaptor.forClass(Order.class);
         verify(orderRepositoryPort).save(saved.capture());
         verify(eventPublisherPort).publishOrderProcessed(saved.getValue());
+    }
+
+    // -------------------------------------------------- contrato de entrada (5.A)
+
+    @Test
+    @DisplayName("Violación del contrato → REJECTED persistido y publicado, con el agregado conservado")
+    void shouldRejectOnContractViolationWhenAggregateBuildable() {
+        givenNoPriorActivity();
+        var command = new ProcessOrderCommand(EVENT_ID, 1L, ORDER_ID, "MX", "MXN", CLIENT_ID, "C1",
+                List.of(new OrderLineCommand("PRD-001", 24, new BigDecimal("35.5")),
+                        new OrderLineCommand("PRD-001", 12, new BigDecimal("82.0"))));
+
+        Order result = service.processOrder(command);
+
+        assertThat(result.getStatus()).isEqualTo(OrderStatus.REJECTED);
+        assertThat(result.getRejectionReason())
+                .contains("CONTRACT_VIOLATION").contains("items productId duplicado");
+        assertThat(result.getOrderId()).isEqualTo(ORDER_ID);
+        assertThat(result.getItems()).hasSize(2);
+        verify(clientsClientPort, never()).getClient(anyString());
+        verify(eventPublisherPort).publishOrderProcessed(result);
+    }
+
+    @Test
+    @DisplayName("Violación que impide construir el agregado → REJECTED con orderId sintético")
+    void shouldRejectOnContractViolationWhenAggregateNotBuildable() {
+        givenNoPriorActivity();
+        var command = new ProcessOrderCommand(EVENT_ID, 1L, null, "MX", "MXN", CLIENT_ID, "C1",
+                List.of(new OrderLineCommand("PRD-001", 24, new BigDecimal("35.5"))));
+
+        Order result = service.processOrder(command);
+
+        assertThat(result.getStatus()).isEqualTo(OrderStatus.REJECTED);
+        assertThat(result.getRejectionReason()).contains("orderId es obligatorio");
+        assertThat(result.getOrderId()).isEqualTo("UNPARSEABLE-" + EVENT_ID);
+        assertThat(result.getItems()).hasSize(1);
+    }
+
+    // ------------------------------------------- mensaje no parseable / reintentos
+
+    @Test
+    @DisplayName("Mensaje no parseable → REJECTED persistido y publicado conservando el payload crudo")
+    void shouldRecordUnprocessableMessage() {
+        when(orderRepositoryPort.save(any())).thenAnswer(invocation -> invocation.getArgument(0));
+
+        Order result = service.recordUnprocessable(new ProcessOrderUseCase.UnprocessableCommand(
+                ORDER_ID, EVENT_ID, "MX", "MXN", null, "DESERIALIZATION: JSON inválido",
+                "{\"rotto\":true}"));
+
+        assertThat(result.getStatus()).isEqualTo(OrderStatus.REJECTED);
+        assertThat(result.getOrderId()).isEqualTo(ORDER_ID);
+        assertThat(result.getEventVersion()).isZero();
+        assertThat(result.getClientId()).isNull();
+        assertThat(result.getMarket()).isNotNull();
+        assertThat(result.getRejectionReason()).contains("DESERIALIZATION");
+        assertThat(result.getSourcePayload()).isEqualTo("{\"rotto\":true}");
+        verify(clientsClientPort, never()).getClient(anyString());
+        verify(eventPublisherPort).publishOrderProcessed(result);
+    }
+
+    @Test
+    @DisplayName("Reintentos agotados → TECHNICAL_FAILURE persistido y publicado sin consultar contexto")
+    void shouldRecordTechnicalFailureWhenRetriesExhausted() {
+        givenNoPriorActivity();
+
+        Order result = service.recordTechnicalFailure(specCommand(), "backoff agotado");
+
+        assertThat(result.getStatus()).isEqualTo(OrderStatus.TECHNICAL_FAILURE);
+        assertThat(result.getRejectionReason()).isEqualTo("TECHNICAL_FAILURE: backoff agotado");
+        assertThat(result.getItems()).hasSize(2);
+        verify(clientsClientPort, never()).getClient(anyString());
+        verify(productsClientPort, never()).getProducts(anySet(), anyString());
+        verify(eventPublisherPort).publishOrderProcessed(result);
     }
 }

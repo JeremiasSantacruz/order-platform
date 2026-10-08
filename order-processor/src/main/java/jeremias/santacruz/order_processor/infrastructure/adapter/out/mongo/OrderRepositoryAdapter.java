@@ -16,6 +16,7 @@ import org.springframework.data.mongodb.core.query.Query;
 import org.springframework.data.mongodb.core.query.Update;
 import org.springframework.stereotype.Component;
 
+import java.util.List;
 import java.util.Optional;
 
 /**
@@ -78,11 +79,18 @@ public class OrderRepositoryAdapter implements OrderRepositoryPort {
         Update update = new Update()
                 .set("eventId", document.eventId())
                 .set("eventVersion", document.eventVersion())
+                .set("market", document.market())
+                .set("currency", document.currency())
+                .set("clientId", document.clientId())
                 .set("items", document.items())
                 .set("status", document.status())
                 .set("totals", document.totals())
                 .set("rejectionReason", document.rejectionReason())
-                .set("processedAt", document.processedAt());
+                .set("processedAt", document.processedAt())
+                // Amplía el documento cuando una versión previa dejó campos sin resolver.
+                .set("client", document.client())
+                .set("enrichedLines", document.enrichedLines())
+                .set("sourcePayload", document.sourcePayload());
         // receivedAt no se sobreescribe: conserva la primera recepción del pedido.
 
         OrderDocument updated = mongoTemplate.findAndModify(query, update,
@@ -107,26 +115,33 @@ public class OrderRepositoryAdapter implements OrderRepositoryPort {
                 order.getOrderId(),
                 order.getEventId(),
                 order.getEventVersion(),
-                order.getMarket().name(),
-                order.getCurrency().name(),
+                // Un pedido parcial (contrato incumplido) puede no tener mercado/moneda/cliente.
+                order.getMarket() == null ? null : order.getMarket().name(),
+                order.getCurrency() == null ? null : order.getCurrency().name(),
                 order.getClientId(),
                 order.getItems(),
                 order.getStatus() == null ? null : order.getStatus().name(),
                 order.getTotals(),
                 order.getRejectionReason(),
                 order.getReceivedAt(),
-                order.getProcessedAt());
+                order.getProcessedAt(),
+                order.getClient(),
+                order.getEnrichedLines(),
+                order.getSourcePayload());
     }
 
     private Order toDomain(OrderDocument document) {
-        Order order = new Order(
+        // Se reconstruye con la fábrica no estricta: un documento escrito por el camino de mensaje
+        // no procesable puede traer market/currency/clientId nulos y sin líneas, y leerlo no debe
+        // romper el mapeo (los campos ausentes se conservan como desconocidos).
+        Order order = Order.partial(
                 document.orderId(),
                 document.eventId(),
                 document.eventVersion(),
-                Market.valueOf(document.market()),
-                Currency.valueOf(document.currency()),
+                document.market() == null ? null : Market.valueOf(document.market()),
+                document.currency() == null ? null : Currency.valueOf(document.currency()),
                 document.clientId(),
-                document.items(),
+                document.items() == null ? List.of() : document.items(),
                 document.receivedAt());
 
         if (document.status() == null) {
@@ -134,11 +149,13 @@ public class OrderRepositoryAdapter implements OrderRepositoryPort {
         }
         switch (OrderStatus.valueOf(document.status())) {
             case APPROVED -> order.approve(document.totals() != null ? document.totals() : OrderTotals.zero(),
+                    document.enrichedLines(), document.client(), document.processedAt());
+            case REJECTED -> order.reject(document.rejectionReason(), document.client(),
                     document.processedAt());
-            case REJECTED -> order.reject(document.rejectionReason(), document.processedAt());
             case TECHNICAL_FAILURE -> order.markTechnicalFailure(document.rejectionReason(),
-                    document.processedAt());
+                    document.client(), document.processedAt());
         }
+        order.setSourcePayload(document.sourcePayload());
         return order;
     }
 }
