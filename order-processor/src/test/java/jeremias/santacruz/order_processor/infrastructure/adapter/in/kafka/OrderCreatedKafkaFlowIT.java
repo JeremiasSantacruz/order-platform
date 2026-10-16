@@ -50,19 +50,22 @@ import static org.mockito.Mockito.when;
 /**
  * Flujo completo de la interfaz de entrada: produce un evento en {@code orders.created.v1},
  * el listener lo procesa contra MongoDB (contenedor de prueba) y el resultado se consume de
- * {@code orders.processed.v1}. Todo mensaje termina publicado y persistido: no existe DLT.
+ * {@code orders.processed.v1}. Los mensajes no procesables (payload ilegible o fuera de contrato)
+ * se derivan a la DLT {@code orders.processing.dlt} con los headers de la sección 7.
  *
  * <p>Se omiten los tests si no hay demonio de Docker disponible.</p>
  */
 @Testcontainers(disabledWithoutDocker = true)
 @SpringBootTest
 @EmbeddedKafka(partitions = 1,
-        topics = {OrderCreatedKafkaFlowIT.CREATED_TOPIC, OrderCreatedKafkaFlowIT.PROCESSED_TOPIC},
+        topics = {OrderCreatedKafkaFlowIT.CREATED_TOPIC, OrderCreatedKafkaFlowIT.PROCESSED_TOPIC,
+                OrderCreatedKafkaFlowIT.DLT_TOPIC},
         bootstrapServersProperty = "spring.kafka.bootstrap-servers")
 class OrderCreatedKafkaFlowIT {
 
     static final String CREATED_TOPIC = "orders.created.v1";
     static final String PROCESSED_TOPIC = "orders.processed.v1";
+    static final String DLT_TOPIC = "orders.processing.dlt";
 
     private static final String EVENT_ID = "01J8ZP6M5E4RH0K7Y2N9A3TQWX";
     private static final String ORDER_ID = "ORD-MX-000147";
@@ -137,8 +140,8 @@ class OrderCreatedKafkaFlowIT {
     }
 
     @Test
-    @DisplayName("5.A: un payload fuera de contrato se publica REJECTED en orders.processed.v1 (sin DLT)")
-    void contractViolationIsRejectedOnProcessedTopic() throws Exception {
+    @DisplayName("5.A: un payload fuera de contrato se publica en la DLT con errorCategory CONTRACT_VIOLATION (sin REJECTED)")
+    void contractViolationGoesToDlt() throws Exception {
         String eventId = EVENT_ID + "-REJ";
         String orderId = "ORD-MX-000148";
         String payload = OrderEventFixtures.emptyItemsPayload()
@@ -147,24 +150,44 @@ class OrderCreatedKafkaFlowIT {
 
         kafkaTemplate.send(CREATED_TOPIC, orderId, payload).get(10, TimeUnit.SECONDS);
 
-        ConsumerRecord<String, String> output = awaitRecord(PROCESSED_TOPIC, orderId, Duration.ofSeconds(30));
+        ConsumerRecord<String, String> dlt = awaitRecord(DLT_TOPIC, orderId, Duration.ofSeconds(30));
 
-        JsonNode event = objectMapper.readTree(output.value());
-        assertThat(event.path("orderId").asText()).isEqualTo(orderId);
-        assertThat(event.path("sourceEventId").asText()).isEqualTo(eventId);
-        assertThat(event.path("status").asText()).isEqualTo("REJECTED");
-        assertThat(event.path("reason").asText()).contains("CONTRACT_VIOLATION");
+        assertThat(dlt.value()).isEqualTo(payload);
+        assertThat(header(dlt, "orderId")).isEqualTo(orderId);
+        assertThat(header(dlt, "eventId")).isEqualTo(eventId);
+        assertThat(header(dlt, "errorCategory")).isEqualTo("CONTRACT_VIOLATION");
+        assertThat(header(dlt, "summaryCause")).contains("items debe tener al menos 1 elemento");
+        assertThat(header(dlt, "attemptCount")).isEqualTo("1");
+        assertThat(header(dlt, "component")).isEqualTo("order-processor");
+        assertThat(header(dlt, "timestamp")).isNotBlank();
 
-        Order stored = orderRepositoryPort.findByOrderId(orderId).orElseThrow();
-        assertThat(stored.getStatus()).isEqualTo(OrderStatus.REJECTED);
-        assertThat(stored.getRejectionReason()).contains("CONTRACT_VIOLATION");
+        // La violación de contrato ya no se persiste como estado final.
+        assertThat(orderRepositoryPort.findByOrderId(orderId)).isEmpty();
     }
 
     @Test
-    @DisplayName("7: un payload que ni siquiera es JSON se registra como no procesable en orders.processed.v1")
-    void unparseablePayloadIsRejectedWithSalvagedIds() throws Exception {
+    @DisplayName("7: un payload que ni siquiera es JSON se publica en la DLT con errorCategory DESERIALIZATION")
+    void unparseablePayloadGoesToDlt() throws Exception {
         String orderId = "ORD-MX-000149";
         String payload = "{esto-no-es-json";
+
+        kafkaTemplate.send(CREATED_TOPIC, orderId, payload).get(10, TimeUnit.SECONDS);
+
+        ConsumerRecord<String, String> dlt = awaitRecord(DLT_TOPIC, orderId, Duration.ofSeconds(30));
+
+        assertThat(dlt.value()).isEqualTo(payload);
+        assertThat(header(dlt, "orderId")).isEqualTo(orderId);
+        assertThat(header(dlt, "errorCategory")).isEqualTo("DESERIALIZATION");
+        assertThat(header(dlt, "attemptCount")).isEqualTo("1");
+    }
+
+    @Test
+    @DisplayName("6.1: un rechazo de negocio (cliente inexistente) se publica REJECTED en orders.processed.v1")
+    void businessRejectionStaysOnProcessedTopic() throws Exception {
+        String orderId = "ORD-MX-000150";
+        String eventId = EVENT_ID + "-NOCLIENT";
+        String payload = OrderEventFixtures.validPayload().replace(ORDER_ID, orderId).replace(EVENT_ID, eventId);
+        when(clientsClientPort.getClient("CLI-99821")).thenReturn(Optional.empty());
 
         kafkaTemplate.send(CREATED_TOPIC, orderId, payload).get(10, TimeUnit.SECONDS);
 
@@ -173,13 +196,15 @@ class OrderCreatedKafkaFlowIT {
         JsonNode event = objectMapper.readTree(output.value());
         assertThat(event.path("orderId").asText()).isEqualTo(orderId);
         assertThat(event.path("status").asText()).isEqualTo("REJECTED");
-        assertThat(event.path("reason").asText()).contains("DESERIALIZATION");
-        assertThat(event.path("market").isNull()).isTrue();
+        assertThat(event.path("reason").asText()).contains("CLIENT_NOT_FOUND");
 
         Order stored = orderRepositoryPort.findByOrderId(orderId).orElseThrow();
         assertThat(stored.getStatus()).isEqualTo(OrderStatus.REJECTED);
-        assertThat(stored.getRejectionReason()).contains("DESERIALIZATION");
-        assertThat(stored.getSourcePayload()).isEqualTo(payload);
+    }
+
+    private static String header(ConsumerRecord<?, ?> record, String name) {
+        org.apache.kafka.common.header.Header header = record.headers().lastHeader(name);
+        return header == null ? null : new String(header.value(), java.nio.charset.StandardCharsets.UTF_8);
     }
 
     private ConsumerRecord<String, String> awaitRecord(String topic, String key, Duration timeout) {

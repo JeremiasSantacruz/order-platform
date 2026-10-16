@@ -12,9 +12,9 @@
 | **Ingeniero B — catálogo** | `products-api` (Go) + `clients-api` (NestJS) y sus contratos | Módulos de las APIs, seeds, tests de contrato |
 | **Ingeniero C — infra/plataforma** | Docker Compose, CI/CD, entornos, monitoreo (Kafdrop, Mongo Express), observabilidad | `docker-compose.yml`, GitHub Actions, scripts de despliegue |
 
-Las áreas de **contrato** (5.A–5.D) son una **frontera compartida** y se tratan como tal:
-cualquier cambio en el wire type de una API es un PR que toca la spec y los consumidores, revisado
-por el equipo dueño del otro lado.
+Los contratos (5.A–5.D) **no son una frontera compartida**: cada uno tiene un único
+**propietario** (el productor del recurso) y se rige por la gobernanza descrita en la **§5**
+(propiedad, versionado, validación en CI, coordinación entre equipos y dominio del proveedor).
 
 ## 2. Flujo de trabajo Git
 
@@ -35,7 +35,7 @@ Pipeline por PR y por merge a `main`:
 # Pipeline resumido (equivalente en GitHub Actions)
 jobs:
   order-processor:
-    - cd order-processor && sh gradlew test        # 104 tests (unit + IT)
+    - cd order-processor && sh gradlew test        # 107 tests (unit + IT)
     - ./gradlew clean build                        # compila fat jar
   clients-api:
     - cd clients-api && npm ci
@@ -45,10 +45,11 @@ jobs:
     - cd products-api && go build ./...
     - go vet ./... && go test ./...
   contracts:
-    - verificación de shape de respuestas contra 5.B/5.C (mock/vcr o pruebas de contrato)
+    - pact verification: order-processor (consumidor) vs clients-api/products-api (5.B/5.C)
+    - shape de respuestas contra 5.B/5.C y campos prohibidos (ver §5.5)
   docker-smoke:
     - docker compose up --profile full --build      # smoke end-to-end (5.A → 5.D)
-    - verificación de un 5xx del catálogo → TECHNICAL_FAILURE persistido y publicado
+    - verificación de un fallo no recuperable → mensaje en la DLT orders.processing.dlt con headers
 ```
 
 **Gates del merge:** los 4 primeros jobs verdes + smoke opcional marcado *required* en `main` +
@@ -64,9 +65,74 @@ revisión humana. **CD:** tag `v*` → build de imágenes → push a registry �
 - **Config externa** vía `env` (nunca hardcode): `KAFKA_BOOTSTRAP_SERVERS`, `MONGO_URI`,
   `CLIENTS_API_BASE_URL`, `PRODUCTS_API_BASE_URL`.
 - **Observabilidad mínima:** logs estructurados SLF4J en el worker; Kafdrop para inspeccionar
-  tópicos; Mongo Express para inspeccionar `orders`; healthchecks en ambas APIs.
+  tópicos; Mongo Express para inspeccionar `orders`; healthchecks en ambas APIs; dashboards de
+  Grafana para la traza por evento (`order-event-logs`) y para métricas de éxitos y DLT derivadas
+  de los logs con LogQL (`order-processing-metrics`).
 
-## 5. Definition of Done (DoD)
+## 5. Gobernanza de contratos
+
+### 5.1 Propiedad de cada contrato
+
+**Regla general:** el **productor** (proveedor del recurso) es el dueño absoluto del contrato que
+expone. Nadie más puede modificarlo unilateralmente; los consumidores participan únicamente a
+través de sus expectativas de contrato (§5.3).
+
+| Contrato | Propietario | Consumidor(es) |
+| --- | --- | --- |
+| Tópico `orders.created.v1` (5.A) | Sistema que origina los pedidos (orquestador que publica hacia Kafka) | `order-processor` como consumidor pasivo |
+| `GET /clients/{clientId}` (5.B) | **clients-api** (NestJS) | `order-processor` |
+| `GET /products/{productId}` (5.C) | **products-api** (Go) | `order-processor` |
+| Tópico `orders.processed.v1` (5.D) | **order-processor** (productor del evento de resultado) | Consumidores de salida (facturación, notificaciones) |
+
+### 5.2 Versionado de cambios incompatibles
+
+- **REST:** versión explícita en la ruta — `/api/v1/...` vs `/api/v2/...` — reservada para
+  *breaking changes*. Agregar un campo opcional no es breaking y va en la versión vigente.
+- **Kafka:** versión en el nombre del tópico (`orders.created.v1`, `orders.processed.v1`) más el
+  campo `eventVersion` en el payload como doble señal.
+- **Principio de tolerancia (lado consumidor):** los adaptadores consumen ignorando campos nuevos
+  desconocidos que envíe el productor. Si el cambio es crítico, se levanta una versión `v2` en
+  paralelo, se da una ventana para que los consumidores migren y recién entonces se depreca `v1`.
+
+### 5.3 Validación de contratos en CI (Consumer-Driven Contracts, Pact)
+
+- `order-processor` genera los **pactos**: archivos de contrato que declaran qué espera recibir de
+  `clients-api` y `products-api` (5.B/5.C) — estado, headers, shape y reglas de negocio mínimas.
+- Los pipelines de CI de `products-api` (Go) y `clients-api` (NestJS) ejecutan la **verificación
+  de pactos** antes de permitir el despliegue. Si un cambio del productor rompe lo que el
+  consumidor necesita, **el pipeline falla automáticamente** y el merge queda bloqueado.
+- Los pactos viven versionados junto al consumidor; el productor solo verifica, nunca edita las
+  expectativas de otro equipo.
+
+### 5.4 Coordinación cuando productor y consumidor son equipos distintos
+
+1. **Contract-first:** el esquema OpenAPI o la definición del evento (5.A–5.D) es la fuente de
+   verdad y se actualiza **primero**, en un PR revisado por ambos lados. Nada de cambios
+   unilaterales del productor.
+2. **Fase de expansión:** el productor implementa el campo o estructura nueva **sin eliminar** la
+   anterior (coexisten temporalmente).
+3. **Fase de migración:** se notifica al equipo consumidor para que actualice su adaptador y
+   consuma la nueva forma; su pipeline de pactos valida la migración.
+4. **Fase de contracción:** cuando todos los consumidores migraron, el productor elimina
+   formalmente el atributo o versión antigua (aquí sí es breaking → nueva versión, §5.2).
+
+### 5.5 Dominio del proveedor: qué se expone y qué no
+
+- **Se expone** (solo lo esencial para que el consumidor cumpla su proceso):
+  - Products API (5.C): `productId`, `name`, `status`, `taxCategory` — necesarios para calcular
+    impuestos y validar elegibilidad.
+  - Clients API (5.B): `clientId`, `status`, `segment`, `taxRegime`, `market`.
+- **No se expone** (dominio interno del proveedor):
+  - Credenciales o hashes de contraseñas, campos de autenticación.
+  - Estructuras internas de persistencia (`__v` de MongoDB, ids internos de colecciones,
+    esquemas de tablas PostgreSQL).
+  - Metadatos de auditoría interna, timestamps de infraestructura, lógica de negocio propietaria
+    del servicio que al consumidor no le incumbe.
+- **Verificación:** los tests de contrato fallan si aparece un campo fuera de la spec (p. ej.
+  `handler_test.go` en products-api rechaza campos prohibidos), de modo que filtrar estado
+  interno es un fallo de CI, no una revisión manual.
+
+## 6. Definition of Done (DoD)
 
 Una historia se considera **done** cuando cumple **todas**:
 
@@ -78,27 +144,28 @@ Una historia se considera **done** cuando cumple **todas**:
 4. Coherencia de consistencia: escenarios 7.1/7.2/7.3 cubiertos con prueba que demuestre el
    comportamiento (idempotencia, CAS, estados finales).
 5. Si el cambio toca un contrato: actualizados spec + consumidores en el **mismo PR**.
-6. Docker Compose levanta el conjunto (smoke 5.A → 5.D) y un fallo no recuperable termina en
-   `TECHNICAL_FAILURE`/`REJECTED` persistido y publicado.
+6. Docker Compose levanta el conjunto (smoke 5.A → 5.D) y un fallo no recuperable termina publicado
+   en la DLT `orders.processing.dlt` con sus headers; los rechazos de negocio siguen como
+   `REJECTED` persistido y publicado en `orders.processed.v1`.
 7. Deuda técnica nueva agregada a `implementation-notes.md` con trigger de cierre explícito.
 8. ADR actualizada si la decisión arquitectónica cambia; de lo contrario, referencia a las
    existentes.
 9. Documentación (README) al día con comandos de ejecución del cambio.
 10. Revisión: PR aprobado por ≥ 1 revisor externo al autor.
 
-## 6. Riesgos y plan de mitigación
+## 7. Riesgos y plan de mitigación
 
 | Riesgo | Probabilidad | Impacto | Mitigación |
 | --- | --- | --- | --- |
-| Drift de contrato entre servicios | Media | Alto | Frontera de contrato compartida; pruebas de shape; revisión cruzada del PR |
+| Drift de contrato entre servicios | Media | Alto | Propiedad explícita por contrato (§5.1); pactos Pact en CI (§5.3); expansión/contracción para cambios (§5.4); revisión cruzada del PR |
 | Pérdida/perdida-ventana de eventos | Baja (por diseño) | Medio | ADR-002 B+E; re-entrega idempotente; estados finales persistidos; revisar outbox si cambian requisitos |
 | Volumen/contención en Mongo | Baja | Medio | Índice `{eventId:1}` pendiente; CAS por `orderId`; evaluar partición por mercado |
 | Kafka no disponible prolongado | Media | Medio | ACK por registro; retención del tópico de entrada y re-entrega idempotente; alerta operativa |
 | Deuda de tests en catálogo Go | Media | Bajo | Pruebas de handler/usecase en siguiente sprint |
 
-## 7. Métricas de salud del equipo
+## 8. Métricas de salud del equipo
 
 - **Ciclo de PR:** objetivo < 1 día laboral de ida y vuelta.
 - **Coverage clave:** cálculo financiero 100% de ramas (unit); escenarios de concurrencia en IT.
 - **Deuda técnica:** revisión quincenal del backlog de `implementation-notes.md`.
-- **Retrospectiva/sprint:** clásica cada 2 semanas con foco en fronteras de contrato.
+- **Retrospectiva/sprint:** clásica cada 2 semanas con foco en gobernanza de contratos (§5).

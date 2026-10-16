@@ -272,23 +272,30 @@ Por cada línea de producto:
 
 ---
 
-### Resolución de Mensajes Fallidos (sin DLT)
+### Tópico de Mensajes Fallidos (`orders.processing.dlt`)
 
-No existe una DLT: **todo mensaje termina persistido en MongoDB y publicado en `orders.processed.v1`**
-con su estado final. La clasificación se resuelve en una de dos capas:
+Enviar a la DLT cuando los reintentos se agoten o ocurra un error no recuperable. Debe incluir
+headers de metadatos:
 
-* **En el listener / caso de uso (sin reintentos):**
-  * Payload no parseable → pedido `REJECTED`, razón `DESERIALIZATION: <detalle>`; se conservan los
-    identificadores legibles del payload (o de la clave del registro, o un id sintético
-    `topic-partition-offset`) y el payload crudo en `sourcePayload`.
-  * Violación del contrato (§5.A) → pedido `REJECTED`, razón `CONTRACT_VIOLATION: <reglas>`.
-* **Al agotar los reintentos con backoff** (429/5xx/timeout o fallo interno repetido) → pedido
-  `TECHNICAL_FAILURE`, razón `TECHNICAL_FAILURE: <causa raíz>`; si el payload ya no se puede leer,
-  se registra como `REJECTED` no procesable.
+* `orderId`, `eventId`
+* `errorCategory`, `summaryCause`
+* `attemptCount`, `timestamp`, `component`
 
-La confirmación del offset se emite recién después de persistir y publicar (ack por registro):
-si el procesamiento falla, Kafka redelivers el mensaje y la idempotencia por `eventId`/`eventVersion`
-(§7) evita efectos duplicados.
+Clasificación en la entrada:
+
+* **Payload no parseable o violación del contrato de entrada (§5.A):** error no recuperable, sin
+  reintentos. Se lanza `ContractViolationException` y el mensaje va directo a la DLT con
+  `errorCategory` `DESERIALIZATION` o `CONTRACT_VIOLATION` respectivamente.
+* **Al agotar los reintentos con backoff** (429/5xx/timeout o fallo interno repetido): a la DLT con
+  `errorCategory=RETRIES_EXHAUSTED`.
+
+Los rechazos de negocio (cliente inexistente/`BLOCKED`, producto `DISCONTINUED`/`NOT_FOUND`, mercado
+incompatible) **no** van a la DLT: son estados finales `REJECTED` persistidos en MongoDB y publicados
+en `orders.processed.v1`.
+
+El **payload original** se reenvía sin modificar como valor del registro de la DLT. La confirmación
+del offset se emite después de publicar en la DLT (ack por registro); una falla de publicación en la
+DLT se registra (best-effort) para no bloquear el consumo de la partición.
 
 ---
 
@@ -307,9 +314,10 @@ si el procesamiento falla, Kafka redelivers el mensaje y la idempotencia por `ev
     ├── architecture-proposal.md  # Arquitectura detallada previo a codificar
     ├── implementation-notes.md   # Notas post-implementación y deuda técnica
     ├── technical-leadership.md   # Estrategia de equipo, CI/CD y Definition of Done
-├── adr-001-concurrency.md    # ADR: Concurrencia y procesamiento
+    ├── adr-001-concurrency.md    # ADR: Concurrencia y procesamiento
     ├── adr-002-consistency.md    # ADR: Consistencia Mongo - Kafka
-    └── adr-003-failure-handling.md # ADR: Manejo de errores sin DLT
+    ├── adr-003-failure-handling.md # ADR: Manejo de errores (superseded)
+    └── adr-004-dlt-failure-handling.md # ADR: Tópico de mensajes fallidos (DLT)
 ```
 
 ---

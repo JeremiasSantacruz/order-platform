@@ -1,6 +1,7 @@
 package jeremias.santacruz.order_processor.infrastructure.config;
 
-import jeremias.santacruz.order_processor.infrastructure.adapter.in.kafka.ProcessingFailureRecoverer;
+import jeremias.santacruz.order_processor.infrastructure.adapter.in.kafka.ContractViolationException;
+import jeremias.santacruz.order_processor.infrastructure.adapter.in.kafka.DltPublishingRecoverer;
 import org.apache.kafka.clients.consumer.Consumer;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.DisplayName;
@@ -18,13 +19,12 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * Política de errores del consumidor: todo fallo (transitorio o no) espera el backoff exponencial
- * y solo al agotar los reintentos {@link ProcessingFailureRecoverer} registra el estado técnico
- * definitivo persistido y publicado. No hay DLT ni casos sin reintentos.
+ * Política de errores del consumidor (sección 7): violaciones de contrato van directo a la DLT
+ * sin reintentos; los fallos transitorios esperan el backoff exponencial.
  */
 class KafkaConsumerConfigTest {
 
-    private final ProcessingFailureRecoverer recoverer = mock(ProcessingFailureRecoverer.class);
+    private final DltPublishingRecoverer recoverer = mock(DltPublishingRecoverer.class);
     private final DefaultErrorHandler handler = new KafkaConsumerConfig().ordersCreatedErrorHandler(recoverer, 3);
     private final ConsumerRecord<String, String> record =
             new ConsumerRecord<>("orders.created.v1", 0, 0L, "ORD-1", "{}");
@@ -36,7 +36,19 @@ class KafkaConsumerConfigTest {
     }
 
     @Test
-    @DisplayName("Fallo: NO se recupera en el primer intento (queda para el backoff)")
+    @DisplayName("Violación de contrato: se recupera inmediatamente, sin reintentos (directo a DLT)")
+    void shouldRecoverContractViolationWithoutRetries() {
+        Exception violation = new ListenerExecutionFailedException("mensaje inválido",
+                new ContractViolationException(ContractViolationException.Category.CONTRACT_VIOLATION,
+                        "items debe tener al menos 1 elemento"));
+
+        handler.handleOne(violation, record, consumer, container);
+
+        verify(recoverer).accept(eq(record), any(Exception.class));
+    }
+
+    @Test
+    @DisplayName("Fallo transitorio: NO se recupera en el primer intento (queda para el backoff)")
     void shouldNotRecoverTransientFailureOnFirstAttempt() {
         Exception transientFailure = new ListenerExecutionFailedException("fallo transitorio",
                 new RuntimeException("429 rate limit"));
@@ -47,18 +59,18 @@ class KafkaConsumerConfigTest {
     }
 
     @Test
-    @DisplayName("Backoff exponencial: tras agotar los reintentos configurados, va al recoverer")
+    @DisplayName("Backoff exponencial: tras agotar los reintentos configurados, va al recoverer (DLT)")
     void shouldRecoverOnlyAfterConfiguredRetriesAreExhausted() {
         Exception transientFailure = new ListenerExecutionFailedException("fallo transitorio",
                 new RuntimeException("timeout"));
 
-        // Los primeros intentos esperan el backoff sin registrar nada.
+        // Los primeros intentos esperan el backoff sin publicar en la DLT.
         for (int i = 0; i < 3; i++) {
             handler.handleOne(transientFailure, record, consumer, container);
         }
         verify(recoverer, never()).accept(any(), any());
 
-        // El siguiente fallo agota ExponentialBackOffWithMaxRetries(3) → recuperación.
+        // El siguiente fallo agota ExponentialBackOffWithMaxRetries(3) → recuperación (DLT).
         handler.handleOne(transientFailure, record, consumer, container);
         verify(recoverer).accept(eq(record), any(Exception.class));
     }

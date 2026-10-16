@@ -3,7 +3,6 @@ package jeremias.santacruz.order_processor.infrastructure.adapter.in.kafka;
 import jeremias.santacruz.order_processor.domain.port.in.ProcessOrderUseCase;
 import jeremias.santacruz.order_processor.domain.port.in.ProcessOrderUseCase.OrderLineCommand;
 import jeremias.santacruz.order_processor.domain.port.in.ProcessOrderUseCase.ProcessOrderCommand;
-import jeremias.santacruz.order_processor.domain.port.in.ProcessOrderUseCase.UnprocessableCommand;
 import org.apache.kafka.clients.consumer.ConsumerRecord;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -13,15 +12,15 @@ import org.mockito.ArgumentCaptor;
 import java.math.BigDecimal;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 
 /**
- * Contrato de entrada: el listener decodifica y mapea al comando del dominio; las reglas del
- * contrato de la sección 5.A se evalúan dentro del caso de uso, así que un payload que es JSON
- * válido siempre llega a {@code processOrder}. Un payload no parseable no sale del flujo: se
- * registra como pedido no procesable con {@code recordUnprocessable}.
+ * Contrato de entrada: el listener decodifica, valida las 7 reglas de la sección 5.A y mapea al
+ * comando del dominio. Un payload no parseable o fuera de contrato es un fallo no recuperable:
+ * se lanza {@link ContractViolationException} para que el manejador de errores lo derive a la DLT.
  */
 class OrderCreatedListenerTest {
 
@@ -36,6 +35,11 @@ class OrderCreatedListenerTest {
 
     private static ConsumerRecord<String, String> record(String payload) {
         return new ConsumerRecord<>("orders.created.v1", 0, 0L, "ORD-MX-000147", payload);
+    }
+
+    private ContractViolationException contractViolation(String payload) {
+        return (ContractViolationException) org.assertj.core.api.Assertions
+                .catchThrowable(() -> listener.onMessage(record(payload)));
     }
 
     @Test
@@ -84,58 +88,41 @@ class OrderCreatedListenerTest {
     }
 
     @Test
-    @DisplayName("JSON inválido → recordUnprocessable con los ids salvables y el payload crudo")
-    void shouldRecordUnprocessableForMalformedJson() {
-        String payload = OrderEventFixtures.malformedPayload();
+    @DisplayName("JSON inválido → ContractViolationException(DESERIALIZATION); no llega al caso de uso")
+    void shouldThrowDeserializationViolationForMalformedJson() {
+        ContractViolationException violation = contractViolation(OrderEventFixtures.malformedPayload());
 
-        listener.onMessage(record(payload));
-
-        ArgumentCaptor<UnprocessableCommand> captor = ArgumentCaptor.forClass(UnprocessableCommand.class);
-        verify(useCase).recordUnprocessable(captor.capture());
-        verify(useCase, never()).processOrder(org.mockito.ArgumentMatchers.any());
-
-        UnprocessableCommand command = captor.getValue();
-        assertThat(command.orderId()).isEqualTo("ORD-MX-000147");
-        assertThat(command.eventId()).isEqualTo("orders.created.v1-0-0");
-        assertThat(command.reason()).startsWith("DESERIALIZATION");
-        assertThat(command.sourcePayload()).isEqualTo(payload);
+        assertThat(violation.getCategory()).isEqualTo(ContractViolationException.Category.DESERIALIZATION);
+        assertThat(violation.getSummaryCause()).contains("payload no interpretable");
+        verify(useCase, never()).processOrder(any());
     }
 
     @Test
-    @DisplayName("JSON inválido sin clave → orderId sintético por tópico/partición/offset")
-    void shouldUseSyntheticOrderIdWithoutKey() {
-        ConsumerRecord<String, String> record =
-                new ConsumerRecord<>("orders.created.v1", 3, 41L, null, "no-json");
+    @DisplayName("Regla 2 (items vacío) → ContractViolationException(CONTRACT_VIOLATION) directo a DLT")
+    void shouldThrowContractViolationForEmptyItems() {
+        ContractViolationException violation = contractViolation(OrderEventFixtures.emptyItemsPayload());
 
-        listener.onMessage(record);
-
-        ArgumentCaptor<UnprocessableCommand> captor = ArgumentCaptor.forClass(UnprocessableCommand.class);
-        verify(useCase).recordUnprocessable(captor.capture());
-        assertThat(captor.getValue().orderId()).isEqualTo("orders.created.v1-3-41");
-        assertThat(captor.getValue().eventId()).isEqualTo("orders.created.v1-3-41");
+        assertThat(violation.getCategory()).isEqualTo(ContractViolationException.Category.CONTRACT_VIOLATION);
+        assertThat(violation.getSummaryCause()).contains("items debe tener al menos 1 elemento");
+        verify(useCase, never()).processOrder(any());
     }
 
     @Test
-    @DisplayName("JSON válido fuera de contrato (regla 2): llega al caso de uso; quantity decimal no deserializa")
-    void shouldForwardContractViolationsToUseCase() {
-        listener.onMessage(record(OrderEventFixtures.emptyItemsPayload()));
+    @DisplayName("Regla 1 (falta orderId) → ContractViolationException(CONTRACT_VIOLATION)")
+    void shouldThrowContractViolationWhenOrderIdMissing() {
+        ContractViolationException violation = contractViolation(OrderEventFixtures.payloadWithoutOrderId());
 
-        org.mockito.ArgumentCaptor<ProcessOrderCommand> captor =
-                org.mockito.ArgumentCaptor.forClass(ProcessOrderCommand.class);
-        verify(useCase).processOrder(captor.capture());
-        assertThat(captor.getValue().items()).isEmpty();
+        assertThat(violation.getCategory()).isEqualTo(ContractViolationException.Category.CONTRACT_VIOLATION);
+        assertThat(violation.getSummaryCause()).contains("orderId es obligatorio");
     }
 
     @Test
-    @DisplayName("quantity decimal (regla 4) no deserializa en int → recordUnprocessable sin llegar al caso de uso")
-    void shouldRecordUnprocessableForFractionalQuantity() {
-        listener.onMessage(record(OrderEventFixtures.fractionalQuantityPayload()));
+    @DisplayName("quantity decimal (regla 4) no deserializa en int → DESERIALIZATION sin llegar al caso de uso")
+    void shouldThrowDeserializationForFractionalQuantity() {
+        ContractViolationException violation =
+                contractViolation(OrderEventFixtures.fractionalQuantityPayload());
 
-        verify(useCase, never()).processOrder(org.mockito.ArgumentMatchers.any());
-        org.mockito.ArgumentCaptor<UnprocessableCommand> captor =
-                org.mockito.ArgumentCaptor.forClass(UnprocessableCommand.class);
-        verify(useCase).recordUnprocessable(captor.capture());
-        assertThat(captor.getValue().reason()).startsWith("DESERIALIZATION");
-        assertThat(captor.getValue().orderId()).isEqualTo("ORD-MX-000147");
+        assertThat(violation.getCategory()).isEqualTo(ContractViolationException.Category.DESERIALIZATION);
+        verify(useCase, never()).processOrder(any());
     }
 }

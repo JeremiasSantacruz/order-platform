@@ -58,15 +58,16 @@ Garantías que se obtienen:
 
 - **Nunca se confirma el offset de un evento cuyo evento de salida no se publicó.** El lector de
   Kafka (commit por registro, `ack-mode: record`) fuerza `ALBD-once`: cada mensaje se procesa hasta
-  publicar o registrar su estado definitivo (backoff → `TECHNICAL_FAILURE`).
+  publicar su resultado o derivarlo a la DLT (backoff agotado → `orders.processing.dlt`, ADR-004).
 - **Nunca se publica un resultado descartado:** el caso de uso interroga el `eventId` realmente
   persistido (ADR-001) antes de publicar.
 - **La reentrega no duplica efectos:** el reproceso taller 7.1 republica *el estado vigente*, y los
   consumidores de `orders.processed.v1` deduplican por `sourceEventId` (contrato 5.D).
-- **Los fallos definitivos también se publican:** intentos agotados del mismo evento con fallo
-  definitivo → se persiste `TECHNICAL_FAILURE` (cierre contable) y se publica su evento; los
-  payloads ilegibles se registran como `REJECTED` no procesable conservando el payload crudo en
-  `sourcePayload` (ADR-003).
+- **Los fallos irrecuperables se derivan a la DLT:** los payloads ilegibles, las violaciones de
+  contrato (no recuperables) y los reintentos agotados se publican en `orders.processing.dlt`
+  conservando el payload crudo (ADR-004, que supersede a ADR-003); los errores externos definitivos
+  (401/2xx malformado) siguen persistiéndose como `TECHNICAL_FAILURE` (cierre contable) y
+  publicándose en `orders.processed.v1`.
 
 ### ¿Por qué no outbox (C) todavía?
 

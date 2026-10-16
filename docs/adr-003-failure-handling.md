@@ -1,9 +1,13 @@
 # ADR-003: Manejo de Errores sin DLT (estado final como contrato)
 
-- **Estado:** Aceptado
+> **Estado: Superseded por [ADR-004](adr-004-dlt-failure-handling.md).** Se conserva como registro
+> histórico de la decisión de la fase 2; la decisión vigente es publicar los mensajes no procesables
+> en la DLT `orders.processing.dlt`.
+
+- **Estado:** Superseded (reemplazado por ADR-004)
 - **Fecha:** 2026-10-07
 - **Decisores:** líder técnico del worker (`order-processor`)
-- **Relacionados:** ADR-001 (concurrencia), ADR-002 (consistencia Mongo-Kafka)
+- **Relacionados:** ADR-001 (concurrencia), ADR-002 (consistencia Mongo-Kafka), ADR-004 (DLT)
 
 ## Contexto
 

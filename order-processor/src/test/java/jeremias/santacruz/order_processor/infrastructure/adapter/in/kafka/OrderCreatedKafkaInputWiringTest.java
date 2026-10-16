@@ -44,7 +44,7 @@ class OrderCreatedKafkaInputWiringTest {
     private OrderEventJsonReader reader;
 
     @Autowired
-    private ProcessingFailureRecoverer recoverer;
+    private DltPublishingRecoverer recoverer;
 
     @Autowired
     private DefaultErrorHandler errorHandler;
@@ -71,7 +71,7 @@ class OrderCreatedKafkaInputWiringTest {
     private RetryRegistry retryRegistry;
 
     @Test
-    @DisplayName("El listener corre en un contenedor con ack-mode record")
+    @DisplayName("El listener corre en un contenedor con ack-mode record y cabecera de intento para la DLT")
     void listenerContainerIsConfigured() {
         MessageListenerContainer container = registry.getListenerContainer("ordersCreatedListener");
 
@@ -83,11 +83,12 @@ class OrderCreatedKafkaInputWiringTest {
                 (ConcurrentMessageListenerContainer<?, ?>) container;
         ContainerProperties properties = kafkaContainer.getContainerProperties();
         assertThat(properties.getAckMode()).isEqualTo(ContainerProperties.AckMode.RECORD);
+        assertThat(properties.isDeliveryAttemptHeader()).isTrue();
         assertThat(properties.getTopics()).contains("orders.created.v1");
     }
 
     @Test
-    @DisplayName("El manejador de errores está publicado como bean único con el recoverer de reintentos agotados")
+    @DisplayName("El manejador de errores está publicado como bean único con el recoverer de DLT")
     void errorHandlerBeanIsWired() {
         assertThat(errorHandler).isNotNull();
         assertThat(recoverer).isNotNull();

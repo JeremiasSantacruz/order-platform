@@ -7,6 +7,9 @@ import jeremias.santacruz.order_processor.domain.model.order.Market;
 import jeremias.santacruz.order_processor.domain.model.order.Order;
 import jeremias.santacruz.order_processor.domain.model.order.OrderLine;
 import jeremias.santacruz.order_processor.domain.model.order.OrderTotals;
+import jeremias.santacruz.order_processor.domain.port.out.EventPublisherPort.DeadLetterInfo;
+import org.apache.kafka.clients.producer.ProducerRecord;
+import org.apache.kafka.common.header.Header;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -14,11 +17,13 @@ import org.mockito.ArgumentCaptor;
 import org.springframework.kafka.core.KafkaTemplate;
 
 import java.math.BigDecimal;
+import java.nio.charset.StandardCharsets;
 import java.time.Instant;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
@@ -42,7 +47,8 @@ class EventPublisherAdapterTest {
     void setUp() {
         kafkaTemplate = mock(KafkaTemplate.class);
         objectMapper = new ObjectMapper();
-        adapter = new EventPublisherAdapter(kafkaTemplate, objectMapper, "orders.processed.v1");
+        adapter = new EventPublisherAdapter(kafkaTemplate, objectMapper, "orders.processed.v1",
+                "orders.processing.dlt", "order-processor");
     }
 
     private Order approvedOrder() {
@@ -123,5 +129,39 @@ class EventPublisherAdapterTest {
         assertThat(json.get("market").isNull()).isTrue();
         assertThat(json.get("currency").isNull()).isTrue();
         assertThat(json.get("reason").asText()).contains("DESERIALIZATION");
+    }
+
+    @Test
+    @DisplayName("La DLT expone los 7 headers de metadatos de la sección 7 y reenvía el payload crudo")
+    void shouldPublishToDltWithSpecHeaders() {
+        when(kafkaTemplate.send(any(ProducerRecord.class)))
+                .thenReturn(CompletableFuture.completedFuture(null));
+        String rawPayload = "{invalid";
+        DeadLetterInfo info = new DeadLetterInfo("ORD-MX-000147", EVENT_ID, "CONTRACT_VIOLATION",
+                "items debe tener al menos 1 elemento", 1,
+                Instant.parse("2026-09-18T15:42:10Z"), "order-processor");
+
+        adapter.publishToDLT(rawPayload, info);
+
+        @SuppressWarnings("unchecked")
+        ArgumentCaptor<ProducerRecord<String, String>> captor =
+                ArgumentCaptor.forClass(ProducerRecord.class);
+        verify(kafkaTemplate).send(captor.capture());
+        ProducerRecord<String, String> record = captor.getValue();
+        assertThat(record.topic()).isEqualTo("orders.processing.dlt");
+        assertThat(record.key()).isEqualTo("ORD-MX-000147");
+        assertThat(record.value()).isEqualTo(rawPayload);
+        assertThat(header(record, "orderId")).isEqualTo("ORD-MX-000147");
+        assertThat(header(record, "eventId")).isEqualTo(EVENT_ID);
+        assertThat(header(record, "errorCategory")).isEqualTo("CONTRACT_VIOLATION");
+        assertThat(header(record, "summaryCause")).isEqualTo("items debe tener al menos 1 elemento");
+        assertThat(header(record, "attemptCount")).isEqualTo("1");
+        assertThat(header(record, "timestamp")).isEqualTo("2026-09-18T15:42:10Z");
+        assertThat(header(record, "component")).isEqualTo("order-processor");
+    }
+
+    private static String header(ProducerRecord<?, ?> record, String name) {
+        Header header = record.headers().lastHeader(name);
+        return header == null ? null : new String(header.value(), StandardCharsets.UTF_8);
     }
 }

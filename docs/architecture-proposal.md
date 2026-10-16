@@ -1,12 +1,5 @@
 # Propuesta de Arquitectura — Plataforma Confiable de Pedidos B2B
 
-> Documento de diseño preparado **antes** de codificar el worker `order-processor`, alineado con
-> `Expecificaciones.md` (secciones 3, 5, 6, 7). Las decisiones registradas aquí se ejecutaron tal
-> cual; las diferencias encontradas durante la implementación se registran en
-> `implementation-notes.md`.
-
----
-
 ## 1. Contexto y Objetivos
 
 - **Dominio:** procesamiento de pedidos B2B originados como eventos Kafka (`orders.created.v1`).
@@ -39,12 +32,12 @@ Kafka + MongoDB.
      │           │                    │  - use case      │                          │
      │           │                    │  - adapters out  │                          │
      ▼           │                    └───┬─────────┬────┘                          │
-┌───────────┐   │                        │         │                               │
- │ consumers │◄──┼────────────────────────┘
- │ orders.   │   │  orders.processed.v1               │ persistencia
- │processed. │   │                                  ▼
- │   v1      │   │                          ┌─────────────┐   ┌──────────────┐      │
-                 │                          │   MongoDB   │   │ orders.proc. │      │
+┌───────────┐    │                        │         │                               │
+│ consumers │◄───┼────────────────────────┘         │                               │
+│ orders.   │    │  orders.processed.v1             │persistencia                   │
+│processed. │    │                                  ▼                               │
+│   v1      │    │                          ┌─────────────┐   ┌──────────────┐      │
+└───────────┘    │                          │   MongoDB   │   │ orders.proc. │      │
                  │                          │             │   │ essed.v1     │      │
                  │                          └─────────────┘   │              │      │
                  │                                            └──────────────┘      │
@@ -59,17 +52,19 @@ Kafka + MongoDB.
 | `products-api` | Go 1.27, net/http, mongo-driver v2 | Catálogo por mercado (contrato 5.C). In-memory para arranque sin credenciales + Mongo con seed. |
 | `clients-api` | NestJS 12, Express, Vitest | Clientes (contrato 5.B). Repositorio en memoria con seed inicial. |
 | Infra | Docker Compose | Kafka + Zookeeper, MongoDB, Kafdrop (9000), Mongo Express (8081). |
+| Observabilidad | Docker Compose | Grafana + loki + promtail |
+
 
 ## 3. Flujo Principal (feliz)
 
 1. Un productor publica `orders.created.v1` con clave `orderId` (partición por pedido).
 2. El `@KafkaListener` deserializa el payload JSON con `OrderEventJsonReader` (estricto en
    `quantity` entero, sin desconocer campos desconocidos).
-3. Los mensajes que no se pueden resolver se atienden como estados finales (ver §4): un payload no
-   parseable se registra con `recordUnprocessable` (reason `DESERIALIZATION`), conservando la
-   información salvable; las violaciones del contrato 5.A se evalúan en el caso de uso
-   (`OrderContractService`) y se rechazan sin reintentos. Ninguno de los dos pasa por el manejador
-   de errores de Kafka.
+3. Los mensajes que no se pueden resolver se derivan a la **DLT** `orders.processing.dlt` (ver §4):
+   un payload no parseable lanza `ContractViolationException(DESERIALIZATION)` y una violación del
+   contrato 5.A (`OrderContractService`) lanza `ContractViolationException(CONTRACT_VIOLATION)`; ambos
+   quedan marcados como **no reintentables** y el manejador de errores los publica en la DLT con los
+   headers de metadatos de la sección 7.
 4. El listener construye `ProcessOrderCommand` y llama a `OrderProcessingService.processOrder`:
    - **Idempotencia (7.1):** si `eventId` ya fue procesado, no recalcula; reenvía el resultado si el
      evento vigente es el mismo (at-least-once del lado de salida).
@@ -103,16 +98,18 @@ Kafka + MongoDB.
   / `products-api`; 3 intentos, 500 ms ×2 hasta 4 s) reintenta **solo** fallos transitorios
   (`RetryableExternalServicePredicate`, que respeta la matriz anterior); el `@RateLimiter` (5/s)
   convierte su rechazo en `429` local transitorio que el `@Retry` exterior reintenta.
-- **Fallo transitorio agotado:** el recoverer (`ProcessingFailureRecoverer`) registra el resultado
-  definitivo con el caso de uso: payload parseable → `TECHNICAL_FAILURE` persistido y publicado
-  (reason `TECHNICAL_FAILURE: <causa raíz>`, totals en cero); payload no parseable →
-  `recordUnprocessable` (reason `RETRIES_EXHAUSTED`). No existe DLT: todo mensaje termina persistido
-  y publicado.
-- **TECHNICAL_FAILURE:** no reintentar un evento definitivamente fallido; se persiste y publica para
-  dar trazabilidad (totals en cero en el evento de salida).
-- **No parseable:** los mensajes que no son JSON (ni `quantity` entero en una línea) se registran
-  en el listener con `recordUnprocessable`; el id de pedido/evento se salva del payload, de la clave
-  del registro o de un id sintético `topic-partition-offset`.
+- **Fallo transitorio agotado:** el recoverer (`DltPublishingRecoverer`) publica el mensaje original
+  en la DLT `orders.processing.dlt` con `errorCategory=RETRIES_EXHAUSTED`, la causa raíz resumida y el
+  número de intentos; no se persiste estado final.
+- **TECHNICAL_FAILURE:** un error externo **definitivo** (401/2xx malformado) no se reintenta; se
+  persiste y se publica en `orders.processed.v1` para dar trazabilidad (totals en cero en el evento
+  de salida).
+- **No parseable / violación de contrato:** los mensajes que no son JSON (ni `quantity` entero en una
+  línea) o que incumplen 5.A lanzan `ContractViolationException` y van **directo a la DLT** sin
+  reintentos, con `errorCategory` `DESERIALIZATION` o `CONTRACT_VIOLATION`.
+- **DLT (`orders.processing.dlt`):** headers `orderId`, `eventId`, `errorCategory`, `summaryCause`,
+  `attemptCount`, `timestamp`, `component`; el payload original se reenvía sin modificar. La
+  publicación es *best-effort* para no crear un bucle de reentrega (ver ADR-004).
 - **Excepción fiscal (6.2):** cliente `EXEMPT` → tasa efectiva 0 %.
 - **Rechazo por catálogo:** `PRODUCT_DISCONTINUED`, `PRODUCT_NOT_FOUND`,
   `CLIENT_NOT_FOUND`, `CLIENT_BLOCKED`, `MARKET_MISMATCH` son razones de `REJECTED`.

@@ -1,29 +1,17 @@
 # Notas de Implementación — post-código y deuda técnica
 
-> Complementa `architecture-proposal.md` y las ADR-001/002 con lo descubierto durante la
+> Complementa `architecture-proposal.md` y las ADR-001/002/004 con lo descubierto durante la
 > implementación y lo que queda pendiente.
 
 ## Estado de la entrega
 
-- **Order-processor:** 104 tests (unit + integración), **0 fallos**; las pruebas de integración
+- **Order-processor:** 107 tests (unit + integración), **0 fallos**; las pruebas de integración
   Mongo/Kafka con Testcontainers quedan **skipped** cuando no hay Docker disponible.
 - **clients-api:** build OK; 10 tests unit + 4 e2e en verde.
 - **products-api:** `go build ./...`, `go vet ./...`, `go test ./...` en verde (sin tests
   específicos todavía).
 - Docker Compose (perfil `full`) alinea los tres servicios + infraestructura; no se validó en
   máquina por daemon Docker inactivo.
-
-## Cambios de alineación de contrato (post-`domain`)
-
-Descubrimos que ambas APIs candidatas desviaban del contrato de las secciones 5.B/5.C y se
-corrigieron para que el worker consuma el wire exacto:
-
-| Servicio | Desviación detectada | Corrección |
-| --- | --- | --- |
-| `clients-api` | Respuesta con `id` y `createdAt` (el contrato 5.B exige `clientId` y solo 6 campos) | Renombrado `id → clientId`; `createdAt` **eliminado del tipo de dominio** (crowd de wire type); specs y e2e actualizados. |
-| `clients-api` | Sin cliente para el ejemplo 5.A→5.D | Seed `CLI-99821` (MX, ACTIVE, WHOLESALE, GENERAL) para hacer end-to-end el ejemplo de la spec. |
-| `products-api` | Mercados `CC/MX/AR`, seeds AR/CL | Constantes `MX/CO/PE`; seeds (memoria y Mongo) remapeados a MX/CO/PE; `PRD-001` y `PRD-008` (STANDARD/ACTIVE) en MX para reproducir los totales 5.D exactos. |
-| `products-api` | `market` ajeno al contrato consultado sin validación | `ErrInvalidMarket` valida miembros de `{MX, CO, PE}` → 400 rápido, clasificado por el worker como no reintentable. |
 
 ## Decisiones de implementación concretas
 
@@ -48,11 +36,14 @@ corrigieron para que el worker consuma el wire exacto:
   traduce a un `429` local transitorio que el `@Retry` exterior vuelve a intentar.
   Nota de auto-invocación: `ProductsClientAdapter.getProducts` llama a `getProduct` internamente,
   así que en el lote solo el aspecto de `getProducts` (lote completo) aplica.
-- **Sin DLT:** no existe tópico de mensajes fallidos. El listener captura los payloads no parseables
-  y los registra con `recordUnprocessable` (salvando los ids legibles y el payload crudo en
-  `sourcePayload`); al agotar los reintentos con backoff, `ProcessingFailureRecoverer` registra
-  `TECHNICAL_FAILURE`. Ambos caminos pasan por el mismo caso de uso: el resultado se persiste y se
-  publica en `orders.processed.v1` con su estado final.
+- **DLT `orders.processing.dlt`:** los payloads no parseables y las violaciones del contrato 5.A
+  lanzan `ContractViolationException` (categoría `DESERIALIZATION` / `CONTRACT_VIOLATION`) y, por ser
+  no reintentables, se publican directo en la DLT; al agotar los reintentos con backoff,
+  `DltPublishingRecoverer` la publica con `errorCategory=RETRIES_EXHAUSTED`. La DLT lleva los headers
+  `orderId`, `eventId`, `errorCategory`, `summaryCause`, `attemptCount`, `timestamp` y `component`
+  (sección 7), y reenvía el payload original sin modificar. La publicación es *best-effort* para no
+  bloquear la partición (ver ADR-004). Los rechazos de negocio y los errores externos definitivos
+  siguen persistiéndose y publicándose en `orders.processed.v1`.
 - **spring-kafka 3.3.16:** el test del error-handler usa la API `handleOne(Exception, record,
   consumer, container)`.
 - **Persistencia:** `OrderDocument` (record) mapea sin configuración extra via Spring Data Mongo;
@@ -71,9 +62,8 @@ corrigieron para que el worker consuma el wire exacto:
    + revisor manual.
 4. **Seeds estáticos duplicados** en `products-api` (memoria vs Mongo): deben mantenerse en
    sincronía a mano; un seed centralizado (fixtures compartidos) es mejora de marcador.
-5. **`products-api` sin tests** propios (build/vet/test vacíos de aserciones): mérito de
    "checklist" cubierto por el worker; sugerido añadir `httptest` del `GetProductUseCase`.
-6. **`eventVersion` de entrada vs salida:** se acepta `eventVersion` como entrada (≥ 1) y se emiten
+5. **`eventVersion` de entrada vs salida:** se acepta `eventVersion` como entrada (≥ 1) y se emiten
    con `1` de salida; no hay versionado de esquema propio más allá del nombre del tópico. Los
    documentos no procesables se guardan con `eventVersion=0` para que cualquier evento válido los
    reemplace vía CAS (ver ADR-003).

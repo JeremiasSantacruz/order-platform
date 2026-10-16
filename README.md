@@ -4,13 +4,14 @@ Worker de procesamiento de pedidos B2B y servicios de catálogo, según `Expecif
 
 - **order-processor** — Java/Spring Boot (hexagonal). Consume `orders.created.v1`, valida,
   consulta clientes/productos, calcula con `BigDecimal`/`HALF_UP`, persiste en MongoDB y publica
-  `orders.processed.v1`; maneja idempotencia (7.1), concurrencia por versión (7.2/7.3) y los
-  mensajes fallidos como estados `REJECTED`/`TECHNICAL_FAILURE` persistidos y publicados (7, sin DLT).
+  `orders.processed.v1`; maneja idempotencia (7.1), concurrencia por versión (7.2/7.3) y deriva los
+  mensajes no procesables a la DLT `orders.processing.dlt` con headers de metadatos (7, ADR-004).
 - **clients-api** — NestJS. `GET /clients/{clientId}` (contrato 5.B).
 - **products-api** — Go. `GET /products/{productId}?market={market}` (contrato 5.C).
 - **Infra** — Docker Compose: Kafka, Zookeeper, MongoDB, Kafdrop, Mongo Express.
 - **Observabilidad** — logs JSON con `eventId`/`orderId` (Logstash encoder) → Promtail → Loki →
-  dashboard en Grafana (`:3001`, provisioning automático).
+  dashboards en Grafana (`:3001`, provisioning automático): traza por evento y métricas de
+  éxitos/DLT derivadas de los logs con LogQL.
 
 ## Estructura
 
@@ -20,7 +21,7 @@ order/
 ├── products-api/             # Catálogo Go
 ├── clients-api/              # Clientes NestJS
 ├── docker-compose.yml        # Infra + perfil 'full' para los 3 servicios
-├── observability/             # Promtail + datasource y dashboard de Grafana (Loki)
+├── observability/             # Promtail + datasource y dashboards de Grafana (Loki)
 ├── scripts/                   # run-tests.sh, kafka-verify/ (verificación E2E)
 ├── README.md
 └── docs/
@@ -105,18 +106,23 @@ Publicar en `orders.created.v1` (clave `orderId`) con la UI de Kafdrop (`http://
 Resultado esperado en `orders.processed.v1`: `status=APPROVED`, `totals` =
 `{grossSubtotal: 1836.00, discount: 25.56, netSubtotal: 1810.44, tax: 289.67, grandTotal: 2100.11}`.
 
-Casos de fallo para probar los estados finales (sin DLT):
+Casos de fallo:
 
-- Cliente `CLI-0003` (BLOCKED) → `REJECTED` con razón.
-- Producto `PRD-003` (DISCONTINUED en PE) → `REJECTED`.
-- Payload que no es JSON → `REJECTED` con razón `DESERIALIZATION`.
+- Cliente `CLI-0003` (BLOCKED) → `REJECTED` con razón en `orders.processed.v1` (rechazo de negocio).
+- Producto `PRD-003` (DISCONTINUED en PE) → `REJECTED` en `orders.processed.v1`.
+- Payload que no es JSON → `DESERIALIZATION` en la DLT `orders.processing.dlt` (headers de la sección 7).
+- Payload fuera de contrato (p. ej. `items` vacío) → `CONTRACT_VIOLATION` en la DLT.
 - Detener `products-api` (5xx/timeout) → reintentos con backoff (HTTP con `@Retry` de Resilience4j y
-  Kafka) → `TECHNICAL_FAILURE` persistido y publicado.
+  Kafka) → `RETRIES_EXHAUSTED` en la DLT; un error definitivo (401/2xx malformado) persiste
+  `TECHNICAL_FAILURE` y lo publica en `orders.processed.v1`.
+
+Inspeccionar la DLT en Kafdrop (`http://localhost:9000`) o con el consumidor de consola para ver los
+headers `orderId`, `eventId`, `errorCategory`, `summaryCause`, `attemptCount`, `timestamp`, `component`.
 
 ## Tests
 
 ```bash
-# order-processor (104 tests: unit + 2 IT con Testcontainers; los IT se omiten sin Docker)
+# order-processor (107 tests: unit + IT con Testcontainers; los IT se omiten sin Docker)
 $env:JAVA_HOME="<ruta-al-jdk21>"; .\gradlew.bat test
 
 # clients-api (10 unit + 4 e2e)
@@ -136,7 +142,7 @@ cd products-api; go build ./...; go vet ./...; go test ./...
 | Kafdrop | 9000 | UI de tópicos |
 | Mongo (local/compuesto) | 27017 | `orders_db.orders` (worker), `catalog_db` (catálogo) |
 | Mongo Express | 8081 | UI de Mongo |
-| Grafana | 3001 | Dashboards (admin/admin; dashboard `order-event-logs`, datasource `loki`) |
+| Grafana | 3001 | Dashboards (admin/admin; `order-event-logs` y `order-processing-metrics`, datasource `loki`) |
 
 ## Observabilidad (logs por evento)
 
@@ -145,6 +151,19 @@ el MDC. Promtail los recolecta de Docker (incluyendo los logs de `clients-api` y
 y los envía a Loki; en Grafana (`http://localhost:3001`, admin/admin) el dashboard **Order Event
 Logs** permite filtrar por `service`, `eventId` y `orderId` para reconstruir la traza completa de
 un pedido (ingesta → validación → llamadas HTTP → Mongo → publicación del estado final).
+
+El dashboard **Métricas de procesamiento (éxitos / DLT)** (`order-processing-metrics`) deriva
+métricas de los mismos logs con LogQL: publicaciones exitosas en `orders.processed.v1` (con
+desglose `APPROVED`/`REJECTED`/`TECHNICAL_FAILURE`), mensajes confirmados en la DLT
+`orders.processing.dlt` agrupados por `errorCategory`, ratio de fallo a DLT y el detalle de los
+últimos mensajes de la DLT. Sin dependencias nuevas: no requiere Prometheus ni exponer un
+puerto de métricas en el worker.
+
+```bash
+# Verificación rápida de las métricas sin abrir Grafana (LogQL contra Loki)
+curl -sG http://localhost:3100/loki/api/v1/query \
+  --data-urlencode 'query=sum by (errorCategory) (count_over_time({service="order-processor"} | json | __error__="" |~ `enviado a la DLT` | regexp `errorCategory=(?P<errorCategory>[A-Z_]+)` [1h]))'
+```
 
 ## Uso de IA (sección 9 de la spec)
 
@@ -165,13 +184,13 @@ un pedido (ingesta → validación → llamadas HTTP → Mongo → publicación 
 | **Kafka exactly-once (`read_committed` + transact idempotente producer)** | No alcanza la consistencia Mongo-Kafka (unidades transaccionales separadas), sobre-promete y complica el consumidor; se adoptó persistir + publicar bloqueante + re-entrega idempotente (ADR-002). |
 | **`FAIL_ON_UNKNOWN_PROPERTIES=true` estricto en la lectura de eventos** | Payloads de productores futuros con campos nuevos romperían el consumidor; se mantuvo tolerancia a propiedades desconocidas con validación estricta de los campos del contrato (quantity entero). |
 | **Crear índices Mongo en el arranque de Spring** | Conectarse a Mongo al arrancar quebraría los tests de contexto sin infraestructura; se difirió a una creación explícita (deuda técnica). |
-| **Reintentos vía *retry topics* de Kafka (`RetryTopicConfiguration`)** | Más grados de movimiento y tópicos auxiliares; `DefaultErrorHandler` con backoff exponencial + estado técnico persistido cubre el spec con menos superficie. |
+| **Reintentos vía *retry topics* de Kafka (`RetryTopicConfiguration`)** | Más grados de movimiento y tópicos auxiliares; `DefaultErrorHandler` con backoff exponencial + DLT `orders.processing.dlt` cubre el spec con menos superficie. |
 
 ## Documentación clave
 
 - `docs/architecture-proposal.md` — diseño previo (flujos principal y alternativos).
 - `docs/adr-001-concurrency.md` / `docs/adr-002-consistency.md` /
-  `docs/adr-003-failure-handling.md` — decisiones de concurrencia, consistencia Mongo-Kafka y
-  manejo de errores sin DLT.
+  `docs/adr-003-failure-handling.md` (superseded) / `docs/adr-004-dlt-failure-handling.md` —
+  decisiones de concurrencia, consistencia Mongo-Kafka y manejo de fallos con DLT.
 - `docs/implementation-notes.md` — notas post-implementación y deuda técnica.
 - `docs/technical-leadership.md` — plan de equipo, CI/CD y DoD.
