@@ -69,13 +69,13 @@ public class OrderCalculatorService {
         BigDecimal tax = BigDecimal.ZERO;
         BigDecimal grandTotal = BigDecimal.ZERO;
 
-        lines.forEach(line -> {
+        for (EnrichedOrderLine line : lines) {
             grossSubtotal = grossSubtotal.add(line.grossSubtotal());
             discount = discount.add(line.discount());
             netSubtotal = netSubtotal.add(line.netSubtotal());
             tax = tax.add(line.taxAmount());
             grandTotal = grandTotal.add(line.lineTotal());
-        });
+        }
 
         return new OrderTotals(grossSubtotal, discount, netSubtotal, tax, grandTotal);
     }

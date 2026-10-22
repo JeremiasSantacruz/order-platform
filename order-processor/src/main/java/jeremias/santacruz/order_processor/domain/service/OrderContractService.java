@@ -1,6 +1,5 @@
 package jeremias.santacruz.order_processor.domain.service;
 
-import jeremias.santacruz.order_processor.domain.model.order.Currency;
 import jeremias.santacruz.order_processor.domain.model.order.Market;
 import jeremias.santacruz.order_processor.domain.port.in.ProcessOrderUseCase.OrderLineCommand;
 import jeremias.santacruz.order_processor.domain.port.in.ProcessOrderUseCase.ProcessOrderCommand;
@@ -141,19 +140,6 @@ public class OrderContractService {
         }
         try {
             return Market.valueOf(market);
-        }
-        catch (IllegalArgumentException ex) {
-            return null;
-        }
-    }
-
-    /** Moneda si es un valor del enum, o {@code null} si no lo es. */
-    public static Currency parseCurrency(String currency) {
-        if (isBlank(currency)) {
-            return null;
-        }
-        try {
-            return Currency.valueOf(currency);
         }
         catch (IllegalArgumentException ex) {
             return null;
