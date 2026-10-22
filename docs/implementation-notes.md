@@ -5,7 +5,7 @@
 
 ## Estado de la entrega
 
-- **Order-processor:** 109 tests (unit + integración), **0 fallos**; las pruebas de integración
+- **Order-processor:** 110 tests (unit + integración), **0 fallos**; las pruebas de integración
   Mongo/Kafka con Testcontainers quedan **skipped** cuando no hay Docker disponible.
 - **clients-api:** build OK; 10 tests unit + 4 e2e en verde.
 - **products-api:** `go build ./...`, `go vet ./...`, `go test ./...` en verde (sin tests

@@ -80,7 +80,7 @@ public class OrderContractService {
             violations.add("items debe tener al menos 1 elemento");
         }
         else {
-            validateItems(command.items(), violations);
+            violations.addAll(validateItems(command.items()));
         }
 
         // Regla 7: la moneda debe corresponder al mercado. Se evalúa solo cuando el mercado es
@@ -97,30 +97,41 @@ public class OrderContractService {
         return List.copyOf(violations);
     }
 
-    private void validateItems(List<OrderLineCommand> items, List<String> violations) {
+    /**
+     * Reglas 3 a 5 para cada línea. El flujo es secuencial y {@code seenProducts} conserva el
+     * orden de aparición: cada repetición de un {@code productId} reporta una violación en la
+     * posición del ítem repetido, preservando el orden de los mensajes de rechazo.
+     */
+    private List<String> validateItems(List<OrderLineCommand> items) {
         Set<String> seenProducts = new HashSet<>();
-        IntStream.range(0, items.size()).forEach(i -> {
-            OrderLineCommand item = items.get(i);
-            if (item == null) {
-                violations.add("items[" + i + "] es obligatorio");
-                return;
-            }
-            if (isBlank(item.productId())) {
-                violations.add("items[" + i + "].productId es obligatorio");
-            }
-            else if (!seenProducts.add(item.productId())) {
-                violations.add("items productId duplicado: " + item.productId());
-            }
-            if (item.quantity() <= 0) {
-                violations.add("items[" + i + "].quantity debe ser un entero mayor que 0");
-            }
-            if (item.unitPrice() == null) {
-                violations.add("items[" + i + "].unitPrice es obligatorio");
-            }
-            else if (item.unitPrice().signum() < 0) {
-                violations.add("items[" + i + "].unitPrice debe ser mayor o igual que 0");
-            }
-        });
+        return IntStream.range(0, items.size())
+                .boxed()
+                .flatMap(i -> validateItem(i, items.get(i), seenProducts).stream())
+                .toList();
+    }
+
+    /** Valida una línea y devuelve sus violaciones en el orden de las reglas 3, 4 y 5. */
+    private List<String> validateItem(int index, OrderLineCommand item, Set<String> seenProducts) {
+        if (item == null) {
+            return List.of("items[" + index + "] es obligatorio");
+        }
+        List<String> violations = new ArrayList<>(3);
+        if (isBlank(item.productId())) {
+            violations.add("items[" + index + "].productId es obligatorio");
+        }
+        else if (!seenProducts.add(item.productId())) {
+            violations.add("items productId duplicado: " + item.productId());
+        }
+        if (item.quantity() <= 0) {
+            violations.add("items[" + index + "].quantity debe ser un entero mayor que 0");
+        }
+        if (item.unitPrice() == null) {
+            violations.add("items[" + index + "].unitPrice es obligatorio");
+        }
+        else if (item.unitPrice().signum() < 0) {
+            violations.add("items[" + index + "].unitPrice debe ser mayor o igual que 0");
+        }
+        return violations;
     }
 
     /** Mercado si es un valor del enum, o {@code null} si no lo es (regla 6). */
