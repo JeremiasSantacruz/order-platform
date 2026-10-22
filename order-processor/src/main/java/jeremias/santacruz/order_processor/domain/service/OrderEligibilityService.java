@@ -19,16 +19,11 @@ public class OrderEligibilityService {
             return Optional.of(String.format("MARKET_MISMATCH: Client market (%s) does not match Order market (%s)", client.market(), orderMarket));
         }
 
-        for (Map.Entry<String, Product> entry : products.entrySet()) {
-            Product product = entry.getValue();
-            if (product == null) {
-                return Optional.of("PRODUCT_NOT_FOUND: Product " + entry.getKey() + " does not exist");
-            }
-            if (!product.isActive()) {
-                return Optional.of("PRODUCT_INACTIVE: Product " + entry.getKey() + " is DISCONTINUED");
-            }
-        }
-
-        return Optional.empty();
+        return products.entrySet().stream()
+                .filter(entry -> entry.getValue() == null || !entry.getValue().isActive())
+                .findFirst()
+                .map(entry -> entry.getValue() == null
+                        ? "PRODUCT_NOT_FOUND: Product " + entry.getKey() + " does not exist"
+                        : "PRODUCT_INACTIVE: Product " + entry.getKey() + " is DISCONTINUED");
     }
 }

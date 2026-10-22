@@ -20,7 +20,6 @@ import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 
 import java.time.Instant;
-import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -28,6 +27,7 @@ import java.util.Map;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 /**
  * Implementación del caso de uso de procesamiento de pedidos: orquesta los puertos de salida
@@ -186,26 +186,21 @@ public class OrderProcessingService implements ProcessOrderUseCase {
      * para que {@link OrderEligibilityService} las clasifique como {@code PRODUCT_NOT_FOUND}.
      */
     private Map<String, Product> loadProducts(ProcessOrderCommand command) {
-        Set<String> productIds = new LinkedHashSet<>();
-        for (OrderLineCommand item : command.items()) {
-            productIds.add(item.productId());
-        }
+        Set<String> productIds = command.items().stream()
+                .map(OrderLineCommand::productId)
+                .collect(Collectors.toCollection(LinkedHashSet::new));
         Map<String, Product> found = productsClientPort.getProducts(productIds, command.market());
-        Map<String, Product> products = new LinkedHashMap<>();
-        for (String productId : productIds) {
-            products.put(productId, found.get(productId));
-        }
-        return products;
+        return productIds.stream().collect(LinkedHashMap::new,
+                (products, productId) -> products.put(productId, found.get(productId)),
+                LinkedHashMap::putAll);
     }
 
     /** Líneas enriquecidas de cada renglón del pedido, ya con su contexto fiscal. */
     private List<EnrichedOrderLine> enrichLines(Order order, Client client, Map<String, Product> products) {
-        List<EnrichedOrderLine> lines = new ArrayList<>();
-        for (OrderLine line : order.getItems()) {
-            lines.add(calculator.calculateLine(line, client, products.get(line.productId()),
-                    order.getMarket()));
-        }
-        return lines;
+        return order.getItems().stream()
+                .map(line -> calculator.calculateLine(line, client, products.get(line.productId()),
+                        order.getMarket()))
+                .toList();
     }
 
     private Order markTechnicalFailure(Order order, ExternalServiceException ex, Client client) {

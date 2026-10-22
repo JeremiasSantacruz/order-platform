@@ -10,6 +10,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.IntStream;
 
 /**
  * Reglas de validación de entrada del contrato {@code orders.created.v1} (sección 5.A).
@@ -98,11 +99,11 @@ public class OrderContractService {
 
     private void validateItems(List<OrderLineCommand> items, List<String> violations) {
         Set<String> seenProducts = new HashSet<>();
-        for (int i = 0; i < items.size(); i++) {
+        IntStream.range(0, items.size()).forEach(i -> {
             OrderLineCommand item = items.get(i);
             if (item == null) {
                 violations.add("items[" + i + "] es obligatorio");
-                continue;
+                return;
             }
             if (isBlank(item.productId())) {
                 violations.add("items[" + i + "].productId es obligatorio");
@@ -119,7 +120,7 @@ public class OrderContractService {
             else if (item.unitPrice().signum() < 0) {
                 violations.add("items[" + i + "].unitPrice debe ser mayor o igual que 0");
             }
-        }
+        });
     }
 
     /** Mercado si es un valor del enum, o {@code null} si no lo es (regla 6). */
