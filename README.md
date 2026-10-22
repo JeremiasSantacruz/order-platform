@@ -6,6 +6,8 @@ Worker de procesamiento de pedidos B2B y servicios de catálogo, según `Expecif
   consulta clientes/productos, calcula con `BigDecimal`/`HALF_UP`, persiste en MongoDB y publica
   `orders.processed.v1`; maneja idempotencia (7.1), concurrencia por versión (7.2/7.3) y deriva los
   mensajes no procesables a la DLT `orders.processing.dlt` con headers de metadatos (7, ADR-004).
+  Corre sobre **hilos virtuales** (JDK 21): el listener de Kafka y las consultas de productos en
+  paralelo se desmontan durante el I/O (ADR-005).
 - **clients-api** — NestJS. `GET /clients/{clientId}` (contrato 5.B).
 - **products-api** — Go. `GET /products/{productId}?market={market}` (contrato 5.C).
 - **Infra** — Docker Compose: Kafka, Zookeeper, MongoDB, Kafdrop, Mongo Express.
@@ -190,7 +192,8 @@ curl -sG http://localhost:3100/loki/api/v1/query \
 
 - `docs/architecture-proposal.md` — diseño previo (flujos principal y alternativos).
 - `docs/adr-001-concurrency.md` / `docs/adr-002-consistency.md` /
-  `docs/adr-003-failure-handling.md` (superseded) / `docs/adr-004-dlt-failure-handling.md` —
-  decisiones de concurrencia, consistencia Mongo-Kafka y manejo de fallos con DLT.
+  `docs/adr-003-failure-handling.md` (superseded) / `docs/adr-004-dlt-failure-handling.md` /
+  `docs/adr-005-virtual-threads.md` — decisiones de concurrencia, consistencia Mongo-Kafka, manejo
+  de fallos con DLT y modelo de ejecución con hilos virtuales.
 - `docs/implementation-notes.md` — notas post-implementación y deuda técnica.
 - `docs/technical-leadership.md` — plan de equipo, CI/CD y DoD.

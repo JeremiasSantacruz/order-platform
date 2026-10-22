@@ -12,18 +12,32 @@ import jeremias.santacruz.order_processor.domain.port.out.ExternalServiceExcepti
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpMethod;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
+import org.springframework.http.client.ClientHttpRequest;
+import org.springframework.http.client.ClientHttpRequestFactory;
+import org.springframework.http.client.ClientHttpResponse;
+import org.springframework.mock.http.client.MockClientHttpResponse;
 import org.springframework.test.web.client.MockRestServiceServer;
 import org.springframework.web.client.RestClient;
 
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
+import java.io.OutputStream;
+import java.net.URI;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
+import java.util.HashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -49,7 +63,8 @@ class ProductsClientAdapterTest {
     @BeforeEach
     void setUp() {
         RestClient.Builder builder = RestClient.builder().baseUrl("http://products.test");
-        server = MockRestServiceServer.bindTo(builder).build();
+        // Las consultas del lote ahora son concurrentes: el orden de llegada no es determinista.
+        server = MockRestServiceServer.bindTo(builder).ignoreExpectOrder(true).build();
         adapter = new ProductsClientAdapter(builder.build());
     }
 
@@ -78,6 +93,21 @@ class ProductsClientAdapterTest {
 
         assertThat(products).containsOnlyKeys("PRD-001");
         assertThat(products.get("PRD-001").taxCategory()).isEqualTo(TaxCategory.STANDARD);
+    }
+
+    @Test
+    @DisplayName("Lote: las consultas corren en paralelo sobre hilos virtuales y el orden se conserva")
+    void shouldQueryProductsInParallelOnVirtualThreads() {
+        VirtualThreadProbeRequestFactory probe = new VirtualThreadProbeRequestFactory();
+        ProductsClientAdapter parallelAdapter = new ProductsClientAdapter(
+                RestClient.builder().baseUrl("http://products.test").requestFactory(probe).build());
+
+        Set<String> ids = new LinkedHashSet<>(List.of("PRD-001", "PRD-008"));
+        Map<String, Product> products = parallelAdapter.getProducts(ids, "MX");
+
+        assertThat(products.keySet()).containsExactly("PRD-001", "PRD-008");
+        assertThat(probe.threadsWereVirtual()).isTrue();
+        assertThat(probe.maxConcurrentRequests()).isEqualTo(2);
     }
 
     @Test
@@ -180,10 +210,12 @@ class ProductsClientAdapterTest {
     }
 
     @Test
-    @DisplayName("429 en cualquier ítem del lote → transitorio y se interrumpe el lote")
+    @DisplayName("429 en un ítem del lote → transitorio (se propaga la primera falla en orden de entrada)")
     void shouldPropagateRetryableFromBatch() {
         server.expect(requestTo("http://products.test/products/PRD-001?market=MX"))
                 .andRespond(withStatus(HttpStatus.TOO_MANY_REQUESTS));
+        server.expect(requestTo("http://products.test/products/PRD-008?market=MX"))
+                .andRespond(withSuccess(PRODUCT_JSON, MediaType.APPLICATION_JSON));
 
         Set<String> ids = new LinkedHashSet<>(List.of("PRD-001", "PRD-008"));
         assertThatThrownBy(() -> adapter.getProducts(ids, "MX"))
@@ -202,5 +234,91 @@ class ProductsClientAdapterTest {
         assertThatThrownBy(() -> adapter.getProduct("PRD-001", "MX"))
                 .isInstanceOfSatisfying(ExternalServiceException.class,
                         ex -> assertThat(ex.isRetryable()).isTrue());
+    }
+
+    /**
+     * Request factory de prueba que demuestra dos cosas a la vez: que las consultas del lote
+     * se solapan (cada una espera a que la otra haya arrancado) y que corren en hilos virtuales.
+     * Si el adaptador consultara secuencialmente, la primera petición agotaría el latch y el
+     * test fallaría en lugar de bloquearse para siempre.
+     */
+    private static final class VirtualThreadProbeRequestFactory implements ClientHttpRequestFactory {
+
+        private final CountDownLatch started = new CountDownLatch(2);
+        private final AtomicInteger inFlight = new AtomicInteger();
+        private final AtomicInteger maxInFlight = new AtomicInteger();
+        private final AtomicInteger platformThreadRequests = new AtomicInteger();
+
+        @Override
+        public ClientHttpRequest createRequest(URI uri, HttpMethod httpMethod) {
+            return new ClientHttpRequest() {
+
+                private final HttpHeaders headers = new HttpHeaders();
+                private final Map<String, Object> attributes = new HashMap<>();
+                private final ByteArrayOutputStream body = new ByteArrayOutputStream();
+
+                @Override
+                public ClientHttpResponse execute() throws IOException {
+                    if (!Thread.currentThread().isVirtual()) {
+                        platformThreadRequests.incrementAndGet();
+                    }
+                    maxInFlight.accumulateAndGet(inFlight.incrementAndGet(), Math::max);
+                    started.countDown();
+                    try {
+                        if (!started.await(5, TimeUnit.SECONDS)) {
+                            throw new IOException("las consultas del lote no se ejecutaron en paralelo");
+                        }
+                    }
+                    catch (InterruptedException ex) {
+                        Thread.currentThread().interrupt();
+                        throw new IOException(ex);
+                    }
+                    finally {
+                        inFlight.decrementAndGet();
+                    }
+
+                    String productId = uri.getPath().substring(uri.getPath().lastIndexOf('/') + 1);
+                    String json = "{\"productId\":\"" + productId + "\",\"name\":\"Producto\","
+                            + "\"sku\":\"SKU\",\"status\":\"ACTIVE\",\"taxCategory\":\"STANDARD\"}";
+                    MockClientHttpResponse response = new MockClientHttpResponse(
+                            json.getBytes(StandardCharsets.UTF_8), HttpStatus.OK);
+                    response.getHeaders().setContentType(MediaType.APPLICATION_JSON);
+                    return response;
+                }
+
+                @Override
+                public HttpMethod getMethod() {
+                    return httpMethod;
+                }
+
+                @Override
+                public URI getURI() {
+                    return uri;
+                }
+
+                @Override
+                public HttpHeaders getHeaders() {
+                    return headers;
+                }
+
+                @Override
+                public OutputStream getBody() {
+                    return body;
+                }
+
+                @Override
+                public Map<String, Object> getAttributes() {
+                    return attributes;
+                }
+            };
+        }
+
+        boolean threadsWereVirtual() {
+            return platformThreadRequests.get() == 0;
+        }
+
+        int maxConcurrentRequests() {
+            return maxInFlight.get();
+        }
     }
 }

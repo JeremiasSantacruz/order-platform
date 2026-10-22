@@ -126,4 +126,19 @@ class OrderContractServiceTest {
 
         assertThat(violations).filteredOn(v -> v.contains("productId duplicado")).hasSize(2);
     }
+
+    @Test
+    @DisplayName("Las violaciones de una línea se reportan en orden de regla y conservan el índice")
+    void shouldReportItemViolationsInRuleOrder() {
+        List<String> violations = contract.validate(command("MX", "MXN", List.of(
+                item("PRD-001", 1, BigDecimal.ONE),
+                new OrderLineCommand(" ", 0, null),
+                item("PRD-001", 1, BigDecimal.ONE))));
+
+        assertThat(violations).containsExactly(
+                "items[1].productId es obligatorio",
+                "items[1].quantity debe ser un entero mayor que 0",
+                "items[1].unitPrice es obligatorio",
+                "items productId duplicado: PRD-001");
+    }
 }

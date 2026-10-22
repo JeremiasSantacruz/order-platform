@@ -2,6 +2,17 @@ spring:
   application:
     name: order-processor
 
+  # --- Modelo de ejecución ---------------------------------------------------------
+  # Hilos virtuales (JDK 21): Spring Boot configura el listener de Kafka con un
+  # SimpleAsyncTaskExecutor virtual y el applicationTaskExecutor con hilos virtuales.
+  # Todo el procesamiento de un mensaje es I/O bloqueante (Kafka, HTTP, Mongo), así que
+  # el hilo virtual se desmonta durante cada espera en lugar de ocupar un hilo de plataforma.
+  # Nota (Spring Kafka): con hilos virtuales la concurrencia del listener no debe superar
+  # los núcleos disponibles para evitar pinning; aquí se mantiene el valor por defecto (1).
+  threads:
+    virtual:
+      enabled: true
+
   # --- Interfaz de entrada Kafka -------------------------------------------------
   kafka:
     bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
