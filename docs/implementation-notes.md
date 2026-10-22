@@ -5,7 +5,7 @@
 
 ## Estado de la entrega
 
-- **Order-processor:** 107 tests (unit + integración), **0 fallos**; las pruebas de integración
+- **Order-processor:** 109 tests (unit + integración), **0 fallos**; las pruebas de integración
   Mongo/Kafka con Testcontainers quedan **skipped** cuando no hay Docker disponible.
 - **clients-api:** build OK; 10 tests unit + 4 e2e en verde.
 - **products-api:** `go build ./...`, `go vet ./...`, `go test ./...` en verde (sin tests
@@ -36,6 +36,14 @@
   traduce a un `429` local transitorio que el `@Retry` exterior vuelve a intentar.
   Nota de auto-invocación: `ProductsClientAdapter.getProducts` llama a `getProduct` internamente,
   así que en el lote solo el aspecto de `getProducts` (lote completo) aplica.
+- **Hilos virtuales (ADR-005):** `spring.threads.virtual.enabled=true` hace que el listener de Kafka
+  corra en un hilo virtual (Spring Boot 3.5 configura `SimpleAsyncTaskExecutor` con
+  `setVirtualThreads(true)`). `ProductsClientAdapter.getProducts` consulta los productos en paralelo
+  con `Executors.newVirtualThreadPerTaskExecutor()` + `invokeAll`, acotado por un `Semaphore(5)` y
+  preservando el orden de entrada (la primera falla en ese orden se propaga). El transporte HTTP usa
+  `JdkClientHttpRequestFactory` (`java.net.http`) para evitar *pinning* en las esperas de red. La
+  concurrencia del listener se mantiene en 1: Spring Kafka recomienda no superar los núcleos
+  disponibles cuando hay hilos virtuales.
 - **DLT `orders.processing.dlt`:** los payloads no parseables y las violaciones del contrato 5.A
   lanzan `ContractViolationException` (categoría `DESERIALIZATION` / `CONTRACT_VIOLATION`) y, por ser
   no reintentables, se publican directo en la DLT; al agotar los reintentos con backoff,
