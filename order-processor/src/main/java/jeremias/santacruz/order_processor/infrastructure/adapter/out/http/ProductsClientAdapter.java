@@ -14,10 +14,18 @@ import org.springframework.web.client.RestClient;
 import org.springframework.web.client.RestClientException;
 import org.springframework.web.client.RestClientResponseException;
 
+import java.util.ArrayList;
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.Semaphore;
 
 /**
  * Adaptador de salida hacia la Products API (Go), contrato de la sección 5.C.
@@ -27,9 +35,17 @@ import java.util.Set;
  * caso de uso clasifica como {@code PRODUCT_NOT_FOUND}; cualquier fallo transitorio interrumpe el
  * lote completo para reintentar el mensaje con todo el contexto.</p>
  *
+ * <p>Cada consulta del lote se ejecuta en un <b>hilo virtual</b> propio (JDK 21): el HTTP es
+ * bloqueante, así que los hilos se desmontan durante la espera de red y el lote termina en el
+ * tiempo de la consulta más lenta en lugar de la suma de todas. Un {@link Semaphore} acota las
+ * peticiones en vuelo para no saturar la API con pedidos de muchas líneas. El resultado conserva
+ * el orden de entrada y la primera falla (en ese orden) es la que se propaga, de modo que el
+ * reintento y la clasificación de errores no dependen de qué respuesta llegó antes.</p>
+ *
  * <p>El throttling es declarativo ({@link RateLimiter}, propiedades {@code resilience4j.ratelimiter.instances.products-api.*}).
- * Cada GET individual y cada lote consumen un permiso; el {@code fallbackMethod} traduce el {@link RequestNotPermitted}
- * del aspecto a un {@code 429} local transitorio y re-lanza intacto cualquier otro fallo.</p>
+ * El lote consume un permiso por invocación (el GET interno no pasa por el proxy, igual que antes
+ * de paralelizar); el {@code fallbackMethod} traduce el {@link RequestNotPermitted} del aspecto a
+ * un {@code 429} local transitorio y re-lanza intacto cualquier otro fallo.</p>
  *
  * <p>El reintento HTTP es declarativo ({@link Retry}, propiedades {@code resilience4j.retry.instances.products-api.*}):
  * se reintentan con backoff exponencial solo los fallos transitorios
@@ -39,6 +55,13 @@ import java.util.Set;
 public class ProductsClientAdapter implements ProductsClientPort {
 
     private static final String SERVICE = "products-api";
+
+    /**
+     * Cota de peticiones concurrentes por lote. Evita que un pedido con muchas líneas dispare
+     * todas las consultas a la vez; los hilos virtuales sobrantes esperan en el semáforo sin
+     * ocupar hilos de plataforma.
+     */
+    static final int MAX_CONCURRENT_REQUESTS = 5;
 
     private final RestClient restClient;
 
@@ -50,17 +73,50 @@ public class ProductsClientAdapter implements ProductsClientPort {
     @Retry(name = "products-api")
     @RateLimiter(name = "products-api", fallbackMethod = "rateLimitFallback")
     public Map<String, Product> getProducts(Set<String> productIds, String market) {
-        Map<String, Product> products = new LinkedHashMap<>();
-        for (String productId : productIds) {
-            getProduct(productId, market).ifPresent(product -> products.put(productId, product));
+        if (productIds == null || productIds.isEmpty()) {
+            return Map.of();
         }
-        return products;
+        List<String> ids = List.copyOf(productIds);
+        Semaphore inFlight = new Semaphore(MAX_CONCURRENT_REQUESTS);
+        try (ExecutorService executor = Executors.newVirtualThreadPerTaskExecutor()) {
+            List<Callable<Optional<Product>>> tasks = new ArrayList<>(ids.size());
+            for (String productId : ids) {
+                tasks.add(() -> {
+                    inFlight.acquire();
+                    try {
+                        return fetchProduct(productId, market);
+                    }
+                    finally {
+                        inFlight.release();
+                    }
+                });
+            }
+            // invokeAll espera a todas las consultas (o las cancela si el hilo se interrumpe)
+            // y devuelve los futuros en el mismo orden en que se enviaron las tareas.
+            List<Future<Optional<Product>>> futures = executor.invokeAll(tasks);
+            Map<String, Product> products = new LinkedHashMap<>();
+            for (int i = 0; i < ids.size(); i++) {
+                String productId = ids.get(i);
+                Optional<Product> product = await(futures.get(i), productId);
+                product.ifPresent(value -> products.put(productId, value));
+            }
+            return products;
+        }
+        catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Consulta de productos interrumpida para market=" + market, ex);
+        }
     }
 
     @Override
     @Retry(name = "products-api")
     @RateLimiter(name = "products-api", fallbackMethod = "rateLimitFallback")
     public Optional<Product> getProduct(String productId, String market) {
+        return fetchProduct(productId, market);
+    }
+
+    /** Consulta HTTP de un producto. Sin anotaciones: el contexto de resiliencia lo aporta el llamador. */
+    private Optional<Product> fetchProduct(String productId, String market) {
         ProductResponse response;
         try {
             response = restClient.get()
@@ -84,6 +140,28 @@ public class ProductsClientAdapter implements ProductsClientPort {
                     "Respuesta vacía de GET /products/" + productId);
         }
         return Optional.of(toDomain(response, productId));
+    }
+
+    /** Espera el resultado de una consulta preservando el tipo de fallo original. */
+    private static Optional<Product> await(Future<Optional<Product>> future, String productId) {
+        try {
+            return future.get();
+        }
+        catch (InterruptedException ex) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("Consulta interrumpida del producto " + productId, ex);
+        }
+        catch (ExecutionException ex) {
+            Throwable cause = ex.getCause();
+            if (cause instanceof InterruptedException interrupted) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("Consulta interrumpida del producto " + productId, interrupted);
+            }
+            if (cause instanceof RuntimeException runtime) {
+                throw runtime;
+            }
+            throw new IllegalStateException("Fallo inesperado consultando el producto " + productId, cause);
+        }
     }
 
     /** Fallback del lote: {@link RequestNotPermitted} → 429 transitorio; el resto se re-lanza intacto. */
